@@ -131,7 +131,13 @@ def enrich_position(pos: dict, asof_date=None) -> dict:
         mult = pos["multiplier"]
         spot_val = spot if spot else 0
         enriched["market_value"] = (enriched["mid_price"] or 0) * qty * mult
-        enriched["notional_gross"] = abs(qty) * mult * spot_val
+        # Gross exposure convention (per user spec):
+        #   - For OPTIONS: delta-adjusted notional = |delta × qty × mult × spot|
+        #   - For STOCKS: cash notional = |qty × spot|
+        # This correctly represents the effective dollar exposure to underlying moves.
+        enriched["notional_gross"] = abs(greeks["delta"]) * abs(qty) * mult * spot_val
+        # Also keep the raw underlying notional for reference (some places use it)
+        enriched["raw_notional"] = abs(qty) * mult * spot_val
         enriched["delta_exposure"] = qty * mult * greeks["delta"] * spot_val
         enriched["unrealized_pnl"] = ((enriched["mid_price"] or pos["entry_price"]) - pos["entry_price"]) * qty * mult
     
@@ -151,7 +157,9 @@ def enrich_position(pos: dict, asof_date=None) -> dict:
         mult = pos["multiplier"]  # Should be 1 for stock
         price = enriched["mid_price"]
         enriched["market_value"] = price * qty * mult
+        # Stock: gross = cash notional (delta=1, so same thing)
         enriched["notional_gross"] = abs(qty) * mult * (spot if spot else 0)
+        enriched["raw_notional"] = enriched["notional_gross"]
         enriched["delta_exposure"] = qty * mult * (spot if spot else 0)
         enriched["unrealized_pnl"] = (price - pos["entry_price"]) * qty * mult
     
@@ -574,13 +582,14 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
             mc_all_pnl = None
             mc_win_rate = np.nan
             if use_mc and qty < 0:  # only for shorts (strategy doesn't apply to longs)
+                # Historical block bootstrap: pass the UNDERLYING ticker (QQQ for SQQQ, SOXX for SOXS)
                 mc_result = simulate_compounded_short(
                     target_notional=notional,
-                    underlying_vol=underlying_vol,
+                    underlying=lai_info["underlying"],
                     tracking_leverage=tracking_leverage,
                     horizon_days=252,
-                    underlying_drift=r_1y_assumption,
                     n_paths=mc_paths,
+                    block_length=5,
                     seed=42,
                 )
                 mc_mean = mc_result["mean_pnl"]
@@ -589,7 +598,6 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
                 mc_p95 = mc_result["p95"]
                 mc_all_pnl = mc_result["all_pnl"]
                 mc_win_rate = mc_result["win_rate"]
-                # USE MEDIAN as the aggregated figure (more robust than mean)
                 total_cash_short_annual_usd += mc_median
             else:
                 total_cash_short_annual_usd += simple_pnl
@@ -648,22 +656,33 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
                     })
             else:
                 # Non-LAI option = protection (e.g. QQQ/SOXX put)
-                # NEW: monthly-roll cost model
-                T = p["T"]
-                if T > 0 and mid and mid > 0 and spot and p["quantity"] > 0:
+                # MONTHLY ROLL MODEL:
+                # Strategy is to maintain a rolling 3M protection put, re-struck to 95% of current spot each month.
+                # We therefore price a CANONICAL 3M 95% put and a 2M 95% put at current spot, 
+                # using the position's current IV (held constant month over month under the assumption of no spot change).
+                # Per-roll cost = (price_3M_fresh - price_2M_aged) × qty × mult
+                # Annualized = per-roll × (12 / roll_freq_months)
+                T_pos = p["T"]
+                if T_pos > 0 and mid and mid > 0 and spot and p["quantity"] > 0:
                     iv = p.get("iv") or 0.20
-                    K = p["strike"]
                     opt_type = p["option_type"]
                     
-                    # Buy price = current mid (at tenor_months, e.g. 3M)
-                    buy_price = mid
-                    # Sell price = BS price at (tenor_months - roll_freq_months) = 2M for 3M buy / 1M roll
-                    sell_T = max((option_tenor_months - roll_frequency_months) / 12.0, 1/365)
-                    sell_price = bs_price(
-                        spot, K, sell_T, RISK_FREE_RATE, DIV_YIELD, iv, opt_type
+                    # Moneyness of the existing strike relative to current spot
+                    # (e.g. K=518, spot=545 → moneyness = 0.95 = "95% put")
+                    K_existing = p["strike"]
+                    moneyness = K_existing / spot
+                    # Price a canonical fresh 3M put at the SAME moneyness and CURRENT spot
+                    K_fresh = spot * moneyness
+                    T_fresh = option_tenor_months / 12.0
+                    T_aged = max((option_tenor_months - roll_frequency_months) / 12.0, 1/365)
+                    
+                    fresh_price = bs_price(
+                        spot, K_fresh, T_fresh, RISK_FREE_RATE, DIV_YIELD, iv, opt_type
                     )
-                    per_roll_cost = (buy_price - sell_price) * p["quantity"] * p["multiplier"]
-                    # Annualized cost = 12 rolls per year × per-roll cost
+                    aged_price = bs_price(
+                        spot, K_fresh, T_aged, RISK_FREE_RATE, DIV_YIELD, iv, opt_type
+                    )
+                    per_roll_cost = (fresh_price - aged_price) * p["quantity"] * p["multiplier"]
                     rolls_per_year = 12 / roll_frequency_months
                     annual_cost = per_roll_cost * rolls_per_year
                     
@@ -671,14 +690,15 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
                     protection_rows.append({
                         "Ticker": p["bbg_ticker"],
                         "Underlying": p["underlying"],
-                        "Strike": K,
-                        "Expiry": p["expiry"],
-                        "Type": opt_type,
+                        "Existing Strike": K_existing,
+                        "Spot": spot,
+                        "Moneyness": moneyness,
+                        "IV Used": iv,
                         "Qty": p["quantity"],
                         "Tenor (mo)": option_tenor_months,
                         "Roll Freq (mo)": roll_frequency_months,
-                        "Buy Price": buy_price,
-                        "Sell Price (after roll)": sell_price,
+                        "Fresh 3M Price": fresh_price,
+                        "Aged 2M Price": aged_price,
                         "Per-Roll Cost ($)": per_roll_cost,
                         "Annual Cost ($)": annual_cost,
                     })
@@ -721,31 +741,32 @@ def sensitivity_vol_sweep(enriched_positions: list,
                            asof_date=None) -> pd.DataFrame:
     """
     Vary each LAI short's underlying vol from 10% to 70%, compute total strategy annual P&L.
+    Uses historical block bootstrap with returns SCALED to match target vol.
     Spot assumed unchanged (0% drift). Protection puts: fixed annualized roll cost at current IV.
-    
-    Returns DataFrame with rows=scenarios (by vol), cols=['Vol', 'Total P&L ($)', 'Return on Gross (%)']
     """
-    from monte_carlo import simulate_compounded_short
+    from monte_carlo import simulate_compounded_short, load_historical_returns
     
     if vol_grid is None:
         vol_grid = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
     
-    # Get open positions and classify
     open_pos = [p for p in enriched_positions if p["status"] == "OPEN"]
-    
-    # For each vol point, compute total annualized P&L
-    # Components:
-    #   - LAI cash shorts: MC-simulated P&L at that vol, per-position
-    #   - LAI options: re-evaluate expected return with new vol (held constant across)
-    #   - Protection: fixed annual cost (unchanged by vol sweep since roll at current IV)
-    
     gross_exposure = sum(p.get("notional_gross") or 0 for p in open_pos)
-    
-    # Precompute protection cost (vol-insensitive for this sweep — holding IV constant at current)
     _, protection_cost = _compute_protection_cost(open_pos)
     
+    # Pre-load and cache per-underlying historical returns
+    underlying_returns_cache = {}
+    for p in open_pos:
+        if is_lai_etf(p["underlying"]):
+            lai_info = get_lai_info(p["underlying"])
+            und_ticker = lai_info["underlying"]
+            if und_ticker not in underlying_returns_cache:
+                rets = load_historical_returns(und_ticker)
+                if rets is not None:
+                    historical_vol = float(rets.std() * np.sqrt(252))
+                    underlying_returns_cache[und_ticker] = (rets, historical_vol)
+    
     rows = []
-    for vol in vol_grid:
+    for target_vol in vol_grid:
         total_short_pnl = 0
         total_lai_opt_pnl = 0
         
@@ -755,21 +776,30 @@ def sensitivity_vol_sweep(enriched_positions: list,
                 spot = p.get("spot") or p.get("mid_price") or 0
                 notional = abs(qty) * spot
                 if qty < 0 and notional > 0:
+                    lai_info = get_lai_info(p["underlying"])
+                    und_ticker = lai_info["underlying"]
+                    if und_ticker not in underlying_returns_cache:
+                        continue
+                    historical_rets, hist_vol = underlying_returns_cache[und_ticker]
+                    # Scale returns to target vol: multiply by target_vol / historical_vol
+                    scale_factor = target_vol / hist_vol if hist_vol > 0 else 1.0
+                    scaled_rets = historical_rets * scale_factor
+                    
                     r = simulate_compounded_short(
                         target_notional=notional,
-                        underlying_vol=vol,
+                        underlying=und_ticker,
                         tracking_leverage=tracking_leverage,
                         horizon_days=252,
-                        underlying_drift=0.0,
                         n_paths=mc_paths,
+                        block_length=5,
                         seed=42,
+                        source_returns=scaled_rets,
                     )
                     total_short_pnl += r["median_pnl"]
             
             elif p["instrument_type"] == "OPTION" and is_lai_etf(p["underlying"]):
-                lai_info = get_lai_info(p["underlying"])
                 result = compute_expected_return_to_expiry(
-                    p, p.get("spot"), p.get("mid_price"), vol, 0.0, asof_date
+                    p, p.get("spot"), p.get("mid_price"), target_vol, 0.0, asof_date
                 )
                 if result and p.get("market_value") is not None:
                     total_lai_opt_pnl += p["market_value"] * result["expected_return_annualized"]
@@ -778,7 +808,7 @@ def sensitivity_vol_sweep(enriched_positions: list,
         pnl_pct = total_pnl / gross_exposure if gross_exposure > 0 else np.nan
         
         rows.append({
-            "Vol": vol,
+            "Vol": target_vol,
             "LAI Shorts P&L": total_short_pnl,
             "LAI Options P&L": total_lai_opt_pnl,
             "Protection Cost": protection_cost,
@@ -797,11 +827,10 @@ def sensitivity_spot_sweep(enriched_positions: list,
                             asof_date=None) -> pd.DataFrame:
     """
     Vary total 1Y underlying move from -50% to +50%, vol held at current realized.
-    For each move, compute total strategy annual P&L.
-    Applies move to underlying — LAI short price path includes that directional drift.
-    Protection puts: repriced at new spot (intrinsic + remaining time value) and roll cost recomputed.
+    For each move, compute total strategy annual P&L using historical block bootstrap
+    with an ADDITIVE daily drift that targets the specified 1-year total underlying move.
     """
-    from monte_carlo import simulate_compounded_short
+    from monte_carlo import simulate_compounded_short, load_historical_returns
     
     if spot_grid is None:
         spot_grid = [-0.50, -0.40, -0.30, -0.20, -0.10, 0.0, 0.10, 0.20, 0.30, 0.40, 0.50]
@@ -809,39 +838,62 @@ def sensitivity_spot_sweep(enriched_positions: list,
     open_pos = [p for p in enriched_positions if p["status"] == "OPEN"]
     gross_exposure = sum(p.get("notional_gross") or 0 for p in open_pos)
     
+    # Pre-load historical returns
+    underlying_returns_cache = {}
+    for p in open_pos:
+        if is_lai_etf(p["underlying"]):
+            lai_info = get_lai_info(p["underlying"])
+            und_ticker = lai_info["underlying"]
+            if und_ticker not in underlying_returns_cache:
+                rets = load_historical_returns(und_ticker)
+                if rets is not None:
+                    underlying_returns_cache[und_ticker] = rets
+    
     rows = []
     for move in spot_grid:
         total_short_pnl = 0
         total_lai_opt_pnl = 0
         total_protection_cost = 0
         
-        # Annualized continuous drift to achieve total 1y move
-        drift = np.log(1.0 + move) if move > -1 else -5  # log(1+m) as annualized drift
+        # Additional daily drift to shift the annual mean return by `move`
+        # Historical cumulative return: Π(1+r) - 1. To shift by `move`, add daily delta
+        # such that (1 + r_orig + delta) raised to 252 equals the target mean shift.
+        # Simpler: use log-drift: delta = log(1+move)/252
+        if move > -0.99:
+            daily_drift_shift = np.log(1.0 + move) / 252.0
+        else:
+            daily_drift_shift = -5 / 252.0
         
         for p in open_pos:
             if p["instrument_type"] == "STOCK" and is_lai_etf(p["underlying"]):
                 lai_info = get_lai_info(p["underlying"])
-                underlying_vol = _get_underlying_vol(lai_info["underlying"], 260)
+                und_ticker = lai_info["underlying"]
+                if und_ticker not in underlying_returns_cache:
+                    continue
+                historical_rets = underlying_returns_cache[und_ticker]
+                # Shift returns: use log-return approach — add delta in log space
+                # Approximation: r_new ≈ r_old + daily_drift_shift for small moves
+                shifted_rets = historical_rets + daily_drift_shift
+                
                 qty = p["quantity"]
                 spot = p.get("spot") or p.get("mid_price") or 0
                 notional = abs(qty) * spot
                 if qty < 0 and notional > 0:
                     r = simulate_compounded_short(
                         target_notional=notional,
-                        underlying_vol=underlying_vol,
+                        underlying=und_ticker,
                         tracking_leverage=tracking_leverage,
                         horizon_days=252,
-                        underlying_drift=drift,
                         n_paths=mc_paths,
+                        block_length=5,
                         seed=42,
+                        source_returns=shifted_rets,
                     )
                     total_short_pnl += r["median_pnl"]
             
             elif p["instrument_type"] == "OPTION" and is_lai_etf(p["underlying"]):
-                # LAI options: recompute expected return with underlying moving `move` over 1y
                 lai_info = get_lai_info(p["underlying"])
                 underlying_vol = _get_underlying_vol(lai_info["underlying"], 260)
-                # Pass the move as r_1y to the decay formula
                 result = compute_expected_return_to_expiry(
                     p, p.get("spot"), p.get("mid_price"), underlying_vol, move, asof_date
                 )
@@ -849,7 +901,6 @@ def sensitivity_spot_sweep(enriched_positions: list,
                     total_lai_opt_pnl += p["market_value"] * result["expected_return_annualized"]
             
             elif p["instrument_type"] == "OPTION" and not is_lai_etf(p["underlying"]) and p["quantity"] > 0:
-                # Protection put: roll cost recomputed with stressed spot
                 spot = p.get("spot")
                 if spot is None:
                     continue
@@ -857,12 +908,7 @@ def sensitivity_spot_sweep(enriched_positions: list,
                 iv = p.get("iv") or 0.20
                 K = p["strike"]
                 opt_type = p["option_type"]
-                
-                # Buy a new 3M 95% put at stressed spot
-                # But wait — protection puts are typically struck at a FIXED strike (95% of original spot at time of entry)
-                # For the roll cost, though, we assume strikes reset monthly to 95% of current spot
-                # So when underlying moves: new strike = stressed_spot × 0.95, new ATM-95% option
-                new_K = stressed_spot * (K / spot)  # preserve relative moneyness
+                new_K = stressed_spot * (K / spot)
                 buy_price = bs_price(stressed_spot, new_K, 0.25, RISK_FREE_RATE, DIV_YIELD, iv, opt_type)
                 sell_price = bs_price(stressed_spot, new_K, 2/12, RISK_FREE_RATE, DIV_YIELD, iv, opt_type)
                 per_roll = (buy_price - sell_price) * p["quantity"] * p["multiplier"]

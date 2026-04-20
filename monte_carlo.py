@@ -1,164 +1,132 @@
 """
-Monte Carlo engine for compounded LAI short strategy.
+Monte Carlo engine for compounded LAI short strategy — HISTORICAL BLOCK BOOTSTRAP.
 
-Strategy mechanic:
-- Short $TARGET_NOTIONAL of LAI ETF (e.g. $15M SQQQ)
-- Each trading day close:
-    * If short MV < TARGET_NOTIONAL: buy more to top up to TARGET (books the gain)
-    * If short MV >= TARGET_NOTIONAL: take no action (ride the loss)
-- Daily LAI return approximated as: leverage × underlying_daily_return
-  (using tracking_leverage, default -3x; can be stressed to -4/-5/-6)
+Replaces earlier GBM simulator. We resample actual historical daily returns of the
+UNDERLYING (QQQ for SQQQ, SOXX for SOXS) in 5-day blocks to preserve short-term
+serial correlation (vol clustering, momentum, mean reversion within a week).
 
-Simulates GBM on the UNDERLYING (e.g. QQQ), then mechanically applies leverage
-to get LAI daily returns. Applies top-up rule each day. Tracks $ P&L per path.
+Block bootstrap specifics:
+- 5-day blocks
+- Circular: blocks can wrap around end of sample so edge days aren't under-sampled
+- Random block starts (with replacement)
 """
 import numpy as np
+import pandas as pd
+from pathlib import Path
+
+DATA_DIR = Path(__file__).parent / "data"
+
+
+def load_historical_returns(underlying: str) -> np.ndarray:
+    """Load historical daily arithmetic returns. Tries local CSV, falls back to yfinance."""
+    ticker = underlying.upper()
+    csv_path = DATA_DIR / f"{ticker}.csv"
+    
+    if csv_path.exists():
+        df = pd.read_csv(csv_path, encoding='utf-8-sig')
+        df.columns = ['Date', 'Price']
+        df['Date'] = pd.to_datetime(df['Date'], format='%d/%m/%Y', errors='coerce')
+        df = df.dropna().sort_values('Date').reset_index(drop=True)
+        return df['Price'].pct_change().dropna().values
+    
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(ticker).history(period="15y", auto_adjust=True)
+        if len(hist) < 100:
+            return None
+        return hist['Close'].pct_change().dropna().values
+    except Exception as e:
+        print(f"load_historical_returns({ticker}) failed: {e}")
+        return None
+
+
+def block_bootstrap_returns(
+    source_returns: np.ndarray,
+    horizon_days: int,
+    n_paths: int,
+    block_length: int = 5,
+    seed: int = 42,
+) -> np.ndarray:
+    """Circular block bootstrap. Returns array of shape (n_paths, horizon_days)."""
+    rng = np.random.default_rng(seed)
+    n_source = len(source_returns)
+    if n_source < block_length:
+        raise ValueError(f"Need >= {block_length} historical days, got {n_source}")
+    
+    blocks_per_path = int(np.ceil(horizon_days / block_length))
+    starts = rng.integers(0, n_source, size=(n_paths, blocks_per_path))
+    offsets = np.arange(block_length)[None, None, :]
+    idx = (starts[:, :, None] + offsets) % n_source
+    idx = idx.reshape(n_paths, -1)[:, :horizon_days]
+    return source_returns[idx]
 
 
 def simulate_compounded_short(
     target_notional: float,
-    underlying_vol: float,
+    underlying: str = "QQQ",
     tracking_leverage: float = -3.0,
     horizon_days: int = 252,
-    underlying_drift: float = 0.0,
     n_paths: int = 5000,
+    block_length: int = 5,
     seed: int = 42,
+    source_returns: np.ndarray = None,
 ) -> dict:
     """
-    Monte Carlo expected annual P&L from a compounded LAI short with daily top-up.
-    
-    Args:
-        target_notional: $ target to maintain short at (e.g. 15_000_000)
-        underlying_vol: annualized vol of the UNDERLYING index (e.g. 0.22 for QQQ)
-        tracking_leverage: leverage of LAI vs underlying (default -3.0, stress: -4/-5/-6)
-        horizon_days: trading days to simulate (default 252 = 1 year)
-        underlying_drift: annualized drift of underlying (default 0% per user spec)
-        n_paths: Monte Carlo paths
-        seed: RNG seed for reproducibility
-    
-    Returns dict with:
-        mean_pnl: mean annual P&L in $
-        median_pnl, p5, p25, p75, p95: percentiles
-        mean_pnl_pct: mean annual return as % of target_notional
-        paths_sample: sample of 50 paths (for display)
+    MC compounded short P&L using historical block bootstrap of the underlying.
+    Daily top-up rule: if short MV < target, top up to target (books the gain).
     """
-    dt = 1.0 / 252.0
-    rng = np.random.default_rng(seed)
+    if source_returns is None:
+        source_returns = load_historical_returns(underlying)
+        if source_returns is None or len(source_returns) < 100:
+            raise ValueError(f"Could not load historical returns for {underlying}")
     
-    # Simulate underlying log-returns: dS/S = μ dt + σ dW
-    # log_ret ~ N((μ - σ²/2) dt, σ²dt)
-    mean_log = (underlying_drift - 0.5 * underlying_vol ** 2) * dt
-    sd_log = underlying_vol * np.sqrt(dt)
+    underlying_rets = block_bootstrap_returns(
+        source_returns, horizon_days, n_paths, block_length, seed
+    )
+    lai_rets = np.maximum(tracking_leverage * underlying_rets, -0.999)
     
-    # Shape: (n_paths, horizon_days)
-    underlying_log_rets = rng.normal(mean_log, sd_log, size=(n_paths, horizon_days))
-    underlying_arith_rets = np.exp(underlying_log_rets) - 1.0
-    
-    # LAI daily arithmetic return = tracking_leverage × underlying arith return
-    lai_rets = tracking_leverage * underlying_arith_rets
-    # Floor at -99.9% to avoid LAI going negative (not realistic, keeps math stable)
-    lai_rets = np.maximum(lai_rets, -0.999)
-    
-    # Simulate the compounded short P&L for each path
-    # State: short_mv (signed negative, we track as positive for simplicity as liability)
-    # We track "short liability" = current MV we owe to buy back; starts at TARGET
-    # Daily pnl = -short_liability × lai_ret  (if LAI up 1%, short loses 1%)
-    # After pnl, new_liability = short_liability × (1 + lai_ret)
-    # Top-up rule: if new_liability < TARGET, we add (TARGET - new_liability) of short
-    #   → cumulative P&L gets banked (TARGET - new_liability), then liability reset to TARGET
-    # If new_liability >= TARGET: do nothing, liability continues
-    
-    # Vectorized path iteration
+    # Compounded short with daily top-up (vectorized path iteration)
     cum_pnl = np.zeros(n_paths)
-    short_liability = np.full(n_paths, target_notional, dtype=float)
-    
+    liability = np.full(n_paths, target_notional, dtype=float)
     for t in range(horizon_days):
         r = lai_rets[:, t]
-        # Daily P&L (for a short: positive r = loss)
-        daily_pnl = -short_liability * r
-        cum_pnl += daily_pnl
-        # Update liability
-        short_liability = short_liability * (1.0 + r)
-        # Top-up rule
-        below_target = short_liability < target_notional
-        # For paths below target: the "gain" is (target - current_liability); already captured in cum_pnl
-        # We just reset liability to target — no additional P&L is booked (already accounted for)
-        short_liability = np.where(below_target, target_notional, short_liability)
+        cum_pnl += -liability * r
+        liability = liability * (1.0 + r)
+        below = liability < target_notional
+        liability = np.where(below, target_notional, liability)
     
-    # Final unrealized loss from any remaining liability above target
-    # When we end above target, there's an unrealized loss sitting on the position
-    # That's already captured in cum_pnl since we've been marking daily
+    # Static short (no rebalancing) for comparison
+    static_liability = np.full(n_paths, target_notional, dtype=float)
+    for t in range(horizon_days):
+        static_liability = static_liability * (1.0 + lai_rets[:, t])
+    static_pnl = target_notional - static_liability
     
-    mean_pnl = float(np.mean(cum_pnl))
-    median_pnl = float(np.median(cum_pnl))
-    p5 = float(np.percentile(cum_pnl, 5))
-    p25 = float(np.percentile(cum_pnl, 25))
-    p75 = float(np.percentile(cum_pnl, 75))
-    p95 = float(np.percentile(cum_pnl, 95))
-    win_rate = float((cum_pnl > 0).mean())
+    # LAI terminal ratio (for diagnostics)
+    lai_terminal = np.prod(1.0 + lai_rets, axis=1)
     
     return {
-        "mean_pnl": mean_pnl,
-        "median_pnl": median_pnl,
-        "p5": p5,
-        "p25": p25,
-        "p75": p75,
-        "p95": p95,
-        "mean_pnl_pct": mean_pnl / target_notional,
-        "median_pnl_pct": median_pnl / target_notional,
-        "win_rate": win_rate,
+        "mean_pnl": float(np.mean(cum_pnl)),
+        "median_pnl": float(np.median(cum_pnl)),
+        "p5": float(np.percentile(cum_pnl, 5)),
+        "p25": float(np.percentile(cum_pnl, 25)),
+        "p75": float(np.percentile(cum_pnl, 75)),
+        "p95": float(np.percentile(cum_pnl, 95)),
+        "mean_pnl_pct": float(np.mean(cum_pnl)) / target_notional,
+        "median_pnl_pct": float(np.median(cum_pnl)) / target_notional,
+        "win_rate": float((cum_pnl > 0).mean()),
         "n_paths": n_paths,
         "horizon_days": horizon_days,
         "target_notional": target_notional,
-        "underlying_vol": underlying_vol,
         "tracking_leverage": tracking_leverage,
-        "all_pnl": cum_pnl,  # full distribution for plotting
+        "block_length": block_length,
+        "underlying": underlying,
+        "all_pnl": cum_pnl,
+        "static_all_pnl": static_pnl,
+        "static_mean_pnl": float(np.mean(static_pnl)),
+        "static_median_pnl": float(np.median(static_pnl)),
+        "lai_terminal_p5": float(np.percentile(lai_terminal, 5)),
+        "lai_terminal_median": float(np.median(lai_terminal)),
+        "lai_terminal_p95": float(np.percentile(lai_terminal, 95)),
+        "lai_terminal_max": float(lai_terminal.max()),
+        "source_n_days": len(source_returns),
     }
-
-
-def simulate_with_vol_sweep(
-    target_notional: float,
-    vol_grid: list,
-    tracking_leverage: float = -3.0,
-    horizon_days: int = 252,
-    n_paths: int = 5000,
-) -> dict:
-    """Run MC across multiple vol points. Returns dict mapping vol -> mean_pnl."""
-    results = {}
-    for v in vol_grid:
-        r = simulate_compounded_short(
-            target_notional=target_notional,
-            underlying_vol=v,
-            tracking_leverage=tracking_leverage,
-            horizon_days=horizon_days,
-            n_paths=n_paths,
-            seed=42,
-        )
-        results[v] = r["mean_pnl"]
-    return results
-
-
-def simulate_with_spot_sweep(
-    target_notional: float,
-    underlying_vol: float,
-    spot_move_grid: list,
-    tracking_leverage: float = -3.0,
-    horizon_days: int = 252,
-    n_paths: int = 5000,
-) -> dict:
-    """Run MC across multiple assumed underlying drifts (expressed as total 1y moves).
-    For spot move m% over 1y, drift = log(1+m) / 1y (geometric average)."""
-    results = {}
-    for move in spot_move_grid:
-        drift = np.log(1.0 + move)  # annualized continuous drift
-        r = simulate_compounded_short(
-            target_notional=target_notional,
-            underlying_vol=underlying_vol,
-            tracking_leverage=tracking_leverage,
-            horizon_days=horizon_days,
-            underlying_drift=drift,
-            n_paths=n_paths,
-            seed=42,
-        )
-        results[move] = r["mean_pnl"]
-    return results

@@ -32,7 +32,7 @@ st.set_page_config(
 init_db()
 
 # -------------------------------------------------------------------------
-BUILD_VERSION = "2026-04-20-r5"
+BUILD_VERSION = "2026-04-20-r6"
 
 st.markdown(f"""
 <style>
@@ -848,16 +848,21 @@ elif page == "💰 Expected Return":
         if len(result["protection_table"]) > 0:
             st.subheader(f"Protection Puts — Monthly Roll ({result['n_protection_options']})")
             t = result["protection_table"].copy()
-            t["Strike"] = t["Strike"].apply(lambda x: fmt_money(x, show_cents=True))
-            t["Buy Price"] = t["Buy Price"].apply(lambda x: fmt_money(x, show_cents=True))
-            t["Sell Price (after roll)"] = t["Sell Price (after roll)"].apply(lambda x: fmt_money(x, show_cents=True))
+            t["Existing Strike"] = t["Existing Strike"].apply(lambda x: fmt_money(x, show_cents=True))
+            t["Spot"] = t["Spot"].apply(lambda x: fmt_money(x, show_cents=True))
+            t["Moneyness"] = t["Moneyness"].apply(lambda x: f"{x*100:.1f}%")
+            t["IV Used"] = t["IV Used"].apply(lambda x: fmt_pct(x, 1))
+            t["Fresh 3M Price"] = t["Fresh 3M Price"].apply(lambda x: fmt_money(x, show_cents=True))
+            t["Aged 2M Price"] = t["Aged 2M Price"].apply(lambda x: fmt_money(x, show_cents=True))
             t["Qty"] = t["Qty"].apply(fmt_int)
             t["Per-Roll Cost ($)"] = t["Per-Roll Cost ($)"].apply(fmt_money)
             t["Annual Cost ($)"] = t["Annual Cost ($)"].apply(fmt_money)
             st.dataframe(t, hide_index=True, use_container_width=True)
             st.caption(
-                "Buy 3-month X% put → 1 month later sell 2-month X% put. "
-                "Assumes underlying unchanged, IV constant. Per-roll cost × 12 = annualized drag."
+                "Monthly roll model: buy fresh 3M put at current spot × moneyness strike; "
+                "1 month later sell as 2M put (assuming spot unchanged, IV constant). "
+                "Per-roll cost × 12 = annualized drag. "
+                "If IV Used looks wrong, check the option on the Positions tab."
             )
         
         st.markdown("---")
