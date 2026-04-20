@@ -385,6 +385,7 @@ def risk_curve(enriched_positions: list, asof_date=None) -> dict:
     # Storage
     pnl_pos = {k: [] for k in pos_keys}
     delta_exp_pos = {k: [] for k in pos_keys}
+    beta_adj_exp_pos = {k: [] for k in pos_keys}  # NEW: per-position beta-adj
     
     summary_rows = []
     
@@ -403,8 +404,7 @@ def risk_curve(enriched_positions: list, asof_date=None) -> dict:
             if not spot:
                 pnl_pos[k].append(0)
                 delta_exp_pos[k].append(0)
-                row_pnl_pos[k] = 0
-                row_delta_exp_pos[k] = 0
+                beta_adj_exp_pos[k].append(0)
                 continue
             
             new_spot = _compute_new_spot(p, spx_move)
@@ -413,24 +413,22 @@ def risk_curve(enriched_positions: list, asof_date=None) -> dict:
             qty = p["quantity"]
             mult = p["multiplier"]
             
-            # Delta-adjusted exposure (signed):
-            # delta × qty × multiplier × new_spot
             delta_exp = new_delta * qty * mult * new_spot
+            
+            # Beta-adjusted per-position
+            beta = p.get("beta")
+            if beta is None or np.isnan(beta):
+                beta = 1.0
+            pos_beta_adj = delta_exp * beta
             
             pnl_pos[k].append(pnl)
             delta_exp_pos[k].append(delta_exp)
-            row_pnl_pos[k] = pnl
-            row_delta_exp_pos[k] = delta_exp
+            beta_adj_exp_pos[k].append(pos_beta_adj)
             
             total_pnl += pnl
             gross_delta_exp += abs(delta_exp)
             net_delta_exp += delta_exp
-            
-            # Beta-adjusted net exposure
-            beta = p.get("beta")
-            if beta is None or np.isnan(beta):
-                beta = 1.0
-            net_beta_adj_exp += delta_exp * beta
+            net_beta_adj_exp += pos_beta_adj
         
         summary_rows.append({
             "SPX Move": labels[len(summary_rows)],
@@ -441,7 +439,6 @@ def risk_curve(enriched_positions: list, asof_date=None) -> dict:
             "Net Beta-Adj Exposure": net_beta_adj_exp,
         })
     
-    # Build DataFrames
     summary_df = pd.DataFrame(summary_rows)
     
     pnl_by_position = pd.DataFrame(pnl_pos, index=labels)
@@ -449,6 +446,13 @@ def risk_curve(enriched_positions: list, asof_date=None) -> dict:
     
     delta_exp_by_position = pd.DataFrame(delta_exp_pos, index=labels)
     delta_exp_by_position["Total"] = delta_exp_by_position.sum(axis=1)
+    
+    beta_adj_exp_by_position = pd.DataFrame(beta_adj_exp_pos, index=labels)
+    beta_adj_exp_by_position["Total"] = beta_adj_exp_by_position.sum(axis=1)
+    
+    # Gross delta exp by position = abs of delta exp per scenario
+    gross_delta_by_position = delta_exp_by_position.drop(columns="Total").abs()
+    gross_delta_by_position["Total"] = gross_delta_by_position.sum(axis=1)
     
     # By direction
     pnl_long = [sum(pnl_pos[k][i] for k in pos_keys if direction_map[k] == "long_beta")
@@ -477,6 +481,8 @@ def risk_curve(enriched_positions: list, asof_date=None) -> dict:
         "pnl_by_direction": pnl_by_direction,
         "delta_exp_by_position": delta_exp_by_position,
         "delta_exp_by_direction": delta_exp_by_direction,
+        "beta_adj_exp_by_position": beta_adj_exp_by_position,
+        "gross_delta_by_position": gross_delta_by_position,
         "direction_map": direction_map,
         "labels": labels,
     }
@@ -502,33 +508,37 @@ def _get_underlying_vol(underlying_ticker: str, lookback_days: int = 260) -> flo
     return vol
 
 
-def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_date=None) -> dict:
+def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_date=None,
+                          use_mc: bool = True, mc_paths: int = 5000,
+                          tracking_leverage: float = -3.0,
+                          roll_frequency_months: int = 1,
+                          option_tenor_months: int = 3) -> dict:
     """
-    Compute expected $ P&L from vol decay (LAI options and cash shorts) minus annualized
-    cost of protection puts. All aggregated in $ terms, then divided by gross capital
-    to get anticipated return on gross deployed.
+    Compute expected $ P&L by leg. Three legs:
     
-    Three legs:
     1. LAI options (long puts / short calls): expected $ return to fair-value at expiry,
-       annualized via CAGR. Assumes vol decay brings LAI price to spot*(1+decay),
-       intrinsic value = max(K - expected_spot, 0) * qty * multiplier.
-    2. Cash shorts on LAI ETFs: 1-year expected vol decay * abs(notional) = $ benefit.
-       A short SQQQ of $10M notional, if SQQQ expected to decay -40% over 1y,
-       gains $4M in year 1.
-    3. Long protection puts (non-LAI, e.g. QQQ/SOXX puts): annualized cost = premium / T.
+       annualized via CAGR using the vol decay formula.
     
-    Net expected $ return = LAI option return + cash short vol decay - protection cost
-    % return on gross deployed = net $ / gross exposure
+    2. Cash shorts on LAI ETFs — TWO METHODS:
+       a) Simple formula: -decay_1y × notional  (reference only, overstates $ P&L)
+       b) Monte Carlo (DEFAULT): simulates GBM path of underlying, applies daily top-up
+          to maintain short at target notional. Captures path-dependent compounding.
+    
+    3. Long protection puts (non-LAI, e.g. QQQ/SOXX) — MONTHLY ROLL MODEL:
+       Buy X-month put, sell it N-months later. Annualized cost = 12 × roll_cost / roll_freq.
+       Assumes no change in underlying.
     """
+    from monte_carlo import simulate_compounded_short
+    
     lai_option_rows = []
     cash_short_rows = []
     protection_rows = []
     
-    # Track $ amounts
     total_lai_option_annual_usd = 0
-    total_cash_short_annual_usd = 0
+    total_cash_short_annual_usd = 0     # using MC if enabled
+    total_cash_short_simple_usd = 0     # simple formula for reference
     total_protection_annual_cost_usd = 0
-    total_gross_exposure = 0  # for final % calc
+    total_gross_exposure = 0
     
     for p in enriched_positions:
         if p["status"] != "OPEN":
@@ -543,26 +553,42 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
             lai_info = get_lai_info(p["underlying"])
             underlying_vol = _get_underlying_vol(lai_info["underlying"], 260)
             
-            # 1-year expected decay of the LAI ETF
+            qty = p["quantity"]
+            notional = abs(qty) * (spot or mid)
+            
+            # Method A: simple formula (for reference)
             decay_1y = compute_vol_decay(
                 r_1y_assumption, lai_info["leverage"], underlying_vol, 1.0
             )
-            
-            qty = p["quantity"]  # signed (negative for short)
-            notional = abs(qty) * (spot or mid)  # gross $
-            
-            # Short LAI benefits from negative decay: 
-            # If decay_1y = -0.40, a short of $10M gains +$4M
-            # If decay_1y = +0.05 (rare), a short of $10M loses -$0.5M
-            # P&L from vol decay over 1y = -decay_1y * notional * sign(-qty)
-            # For short (qty < 0): we gain from decay → sign = +1, pnl = -decay * notional
-            # For long (qty > 0): we lose from decay → pnl = +decay * notional (usually negative)
             if qty < 0:
-                annual_pnl_usd = -decay_1y * notional
+                simple_pnl = -decay_1y * notional
             else:
-                annual_pnl_usd = decay_1y * notional
+                simple_pnl = decay_1y * notional
+            total_cash_short_simple_usd += simple_pnl
             
-            total_cash_short_annual_usd += annual_pnl_usd
+            # Method B: Monte Carlo (compounded top-up)
+            mc_mean = np.nan
+            mc_median = np.nan
+            mc_p5 = np.nan
+            mc_p95 = np.nan
+            if use_mc and qty < 0:  # only for shorts (strategy doesn't apply to longs)
+                mc_result = simulate_compounded_short(
+                    target_notional=notional,
+                    underlying_vol=underlying_vol,
+                    tracking_leverage=tracking_leverage,
+                    horizon_days=252,
+                    underlying_drift=r_1y_assumption,
+                    n_paths=mc_paths,
+                    seed=42,
+                )
+                mc_mean = mc_result["mean_pnl"]
+                mc_median = mc_result["median_pnl"]
+                mc_p5 = mc_result["p5"]
+                mc_p95 = mc_result["p95"]
+                total_cash_short_annual_usd += mc_mean
+            else:
+                # Fallback: use simple formula
+                total_cash_short_annual_usd += simple_pnl
             
             cash_short_rows.append({
                 "Ticker": p["bbg_ticker"],
@@ -571,8 +597,12 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
                 "Spot": spot,
                 "Notional ($)": notional,
                 "Underlying Vol": underlying_vol,
-                "1Y Expected Decay": decay_1y,
-                "Annual P&L ($)": annual_pnl_usd,
+                "1Y Simple Decay": decay_1y,
+                "Simple $ P&L": simple_pnl,
+                "MC Mean $ P&L": mc_mean,
+                "MC Median $ P&L": mc_median,
+                "MC 5th pct": mc_p5,
+                "MC 95th pct": mc_p95,
             })
         
         # ===== OPTION POSITIONS =====
@@ -588,9 +618,6 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
                 
                 if result and p.get("market_value") is not None:
                     mv = p["market_value"]
-                    # Annual $ P&L = market_value × annualized return
-                    # For long put (mv > 0): gain at annualized rate
-                    # For short put (mv < 0): we collected premium, lose if exercised
                     annual_pnl_usd = mv * result["expected_return_annualized"]
                     total_lai_option_annual_usd += annual_pnl_usd
                     
@@ -614,35 +641,49 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
                         "Annual P&L ($)": annual_pnl_usd,
                     })
             else:
-                # Non-LAI option = protection (e.g. QQQ/SOXX/SPY put)
+                # Non-LAI option = protection (e.g. QQQ/SOXX put)
+                # NEW: monthly-roll cost model
                 T = p["T"]
-                if T > 0 and mid and mid > 0:
-                    premium = mid * abs(p["quantity"]) * p["multiplier"]
-                    annual_cost = premium / T  # $ per year
-                    # Only counts as protection cost if we're LONG the put
-                    if p["quantity"] > 0:
-                        total_protection_annual_cost_usd += annual_cost
-                        protection_rows.append({
-                            "Ticker": p["bbg_ticker"],
-                            "Underlying": p["underlying"],
-                            "Strike": p["strike"],
-                            "Expiry": p["expiry"],
-                            "Type": p["option_type"],
-                            "Qty": p["quantity"],
-                            "Years to Expiry": T,
-                            "Current Mid": mid,
-                            "Total Premium ($)": premium,
-                            "Annual Cost ($)": annual_cost,
-                        })
+                if T > 0 and mid and mid > 0 and spot and p["quantity"] > 0:
+                    iv = p.get("iv") or 0.20
+                    K = p["strike"]
+                    opt_type = p["option_type"]
+                    
+                    # Buy price = current mid (at tenor_months, e.g. 3M)
+                    buy_price = mid
+                    # Sell price = BS price at (tenor_months - roll_freq_months) = 2M for 3M buy / 1M roll
+                    sell_T = max((option_tenor_months - roll_frequency_months) / 12.0, 1/365)
+                    sell_price = bs_price(
+                        spot, K, sell_T, RISK_FREE_RATE, DIV_YIELD, iv, opt_type
+                    )
+                    per_roll_cost = (buy_price - sell_price) * p["quantity"] * p["multiplier"]
+                    # Annualized cost = 12 rolls per year × per-roll cost
+                    rolls_per_year = 12 / roll_frequency_months
+                    annual_cost = per_roll_cost * rolls_per_year
+                    
+                    total_protection_annual_cost_usd += annual_cost
+                    protection_rows.append({
+                        "Ticker": p["bbg_ticker"],
+                        "Underlying": p["underlying"],
+                        "Strike": K,
+                        "Expiry": p["expiry"],
+                        "Type": opt_type,
+                        "Qty": p["quantity"],
+                        "Tenor (mo)": option_tenor_months,
+                        "Roll Freq (mo)": roll_frequency_months,
+                        "Buy Price": buy_price,
+                        "Sell Price (after roll)": sell_price,
+                        "Per-Roll Cost ($)": per_roll_cost,
+                        "Annual Cost ($)": annual_cost,
+                    })
     
-    # Net expected $ return
+    # Net expected $ return (using MC for shorts if enabled)
     net_annual_pnl_usd = (
         total_lai_option_annual_usd
         + total_cash_short_annual_usd
         - total_protection_annual_cost_usd
     )
     
-    # Return on gross deployed
     if total_gross_exposure > 0:
         return_on_gross = net_annual_pnl_usd / total_gross_exposure
     else:
@@ -652,19 +693,213 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
         "lai_option_table": pd.DataFrame(lai_option_rows),
         "cash_short_table": pd.DataFrame(cash_short_rows),
         "protection_table": pd.DataFrame(protection_rows),
-        # $ amounts
         "total_lai_option_annual_usd": total_lai_option_annual_usd,
         "total_cash_short_annual_usd": total_cash_short_annual_usd,
+        "total_cash_short_simple_usd": total_cash_short_simple_usd,
         "total_protection_annual_cost_usd": total_protection_annual_cost_usd,
         "net_annual_pnl_usd": net_annual_pnl_usd,
-        # gross
         "total_gross_exposure": total_gross_exposure,
         "return_on_gross": return_on_gross,
-        # counts
         "n_lai_options": len(lai_option_rows),
         "n_cash_shorts": len(cash_short_rows),
         "n_protection_options": len(protection_rows),
+        "use_mc": use_mc,
+        "tracking_leverage": tracking_leverage,
     }
+
+
+def sensitivity_vol_sweep(enriched_positions: list,
+                           vol_grid: list = None,
+                           tracking_leverage: float = -3.0,
+                           mc_paths: int = 3000,
+                           asof_date=None) -> pd.DataFrame:
+    """
+    Vary each LAI short's underlying vol from 10% to 70%, compute total strategy annual P&L.
+    Spot assumed unchanged (0% drift). Protection puts: fixed annualized roll cost at current IV.
+    
+    Returns DataFrame with rows=scenarios (by vol), cols=['Vol', 'Total P&L ($)', 'Return on Gross (%)']
+    """
+    from monte_carlo import simulate_compounded_short
+    
+    if vol_grid is None:
+        vol_grid = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
+    
+    # Get open positions and classify
+    open_pos = [p for p in enriched_positions if p["status"] == "OPEN"]
+    
+    # For each vol point, compute total annualized P&L
+    # Components:
+    #   - LAI cash shorts: MC-simulated P&L at that vol, per-position
+    #   - LAI options: re-evaluate expected return with new vol (held constant across)
+    #   - Protection: fixed annual cost (unchanged by vol sweep since roll at current IV)
+    
+    gross_exposure = sum(p.get("notional_gross") or 0 for p in open_pos)
+    
+    # Precompute protection cost (vol-insensitive for this sweep — holding IV constant at current)
+    _, protection_cost = _compute_protection_cost(open_pos)
+    
+    rows = []
+    for vol in vol_grid:
+        total_short_pnl = 0
+        total_lai_opt_pnl = 0
+        
+        for p in open_pos:
+            if p["instrument_type"] == "STOCK" and is_lai_etf(p["underlying"]):
+                qty = p["quantity"]
+                spot = p.get("spot") or p.get("mid_price") or 0
+                notional = abs(qty) * spot
+                if qty < 0 and notional > 0:
+                    r = simulate_compounded_short(
+                        target_notional=notional,
+                        underlying_vol=vol,
+                        tracking_leverage=tracking_leverage,
+                        horizon_days=252,
+                        underlying_drift=0.0,
+                        n_paths=mc_paths,
+                        seed=42,
+                    )
+                    total_short_pnl += r["mean_pnl"]
+            
+            elif p["instrument_type"] == "OPTION" and is_lai_etf(p["underlying"]):
+                lai_info = get_lai_info(p["underlying"])
+                result = compute_expected_return_to_expiry(
+                    p, p.get("spot"), p.get("mid_price"), vol, 0.0, asof_date
+                )
+                if result and p.get("market_value") is not None:
+                    total_lai_opt_pnl += p["market_value"] * result["expected_return_annualized"]
+        
+        total_pnl = total_short_pnl + total_lai_opt_pnl - protection_cost
+        pnl_pct = total_pnl / gross_exposure if gross_exposure > 0 else np.nan
+        
+        rows.append({
+            "Vol": vol,
+            "LAI Shorts P&L": total_short_pnl,
+            "LAI Options P&L": total_lai_opt_pnl,
+            "Protection Cost": protection_cost,
+            "Total P&L ($)": total_pnl,
+            "Total P&L ($M)": total_pnl / 1e6,
+            "Return on Gross (%)": pnl_pct,
+        })
+    
+    return pd.DataFrame(rows)
+
+
+def sensitivity_spot_sweep(enriched_positions: list,
+                            spot_grid: list = None,
+                            tracking_leverage: float = -3.0,
+                            mc_paths: int = 3000,
+                            asof_date=None) -> pd.DataFrame:
+    """
+    Vary total 1Y underlying move from -50% to +50%, vol held at current realized.
+    For each move, compute total strategy annual P&L.
+    Applies move to underlying — LAI short price path includes that directional drift.
+    Protection puts: repriced at new spot (intrinsic + remaining time value) and roll cost recomputed.
+    """
+    from monte_carlo import simulate_compounded_short
+    
+    if spot_grid is None:
+        spot_grid = [-0.50, -0.40, -0.30, -0.20, -0.10, 0.0, 0.10, 0.20, 0.30, 0.40, 0.50]
+    
+    open_pos = [p for p in enriched_positions if p["status"] == "OPEN"]
+    gross_exposure = sum(p.get("notional_gross") or 0 for p in open_pos)
+    
+    rows = []
+    for move in spot_grid:
+        total_short_pnl = 0
+        total_lai_opt_pnl = 0
+        total_protection_cost = 0
+        
+        # Annualized continuous drift to achieve total 1y move
+        drift = np.log(1.0 + move) if move > -1 else -5  # log(1+m) as annualized drift
+        
+        for p in open_pos:
+            if p["instrument_type"] == "STOCK" and is_lai_etf(p["underlying"]):
+                lai_info = get_lai_info(p["underlying"])
+                underlying_vol = _get_underlying_vol(lai_info["underlying"], 260)
+                qty = p["quantity"]
+                spot = p.get("spot") or p.get("mid_price") or 0
+                notional = abs(qty) * spot
+                if qty < 0 and notional > 0:
+                    r = simulate_compounded_short(
+                        target_notional=notional,
+                        underlying_vol=underlying_vol,
+                        tracking_leverage=tracking_leverage,
+                        horizon_days=252,
+                        underlying_drift=drift,
+                        n_paths=mc_paths,
+                        seed=42,
+                    )
+                    total_short_pnl += r["mean_pnl"]
+            
+            elif p["instrument_type"] == "OPTION" and is_lai_etf(p["underlying"]):
+                # LAI options: recompute expected return with underlying moving `move` over 1y
+                lai_info = get_lai_info(p["underlying"])
+                underlying_vol = _get_underlying_vol(lai_info["underlying"], 260)
+                # Pass the move as r_1y to the decay formula
+                result = compute_expected_return_to_expiry(
+                    p, p.get("spot"), p.get("mid_price"), underlying_vol, move, asof_date
+                )
+                if result and p.get("market_value") is not None:
+                    total_lai_opt_pnl += p["market_value"] * result["expected_return_annualized"]
+            
+            elif p["instrument_type"] == "OPTION" and not is_lai_etf(p["underlying"]) and p["quantity"] > 0:
+                # Protection put: roll cost recomputed with stressed spot
+                spot = p.get("spot")
+                if spot is None:
+                    continue
+                stressed_spot = spot * (1 + move)
+                iv = p.get("iv") or 0.20
+                K = p["strike"]
+                opt_type = p["option_type"]
+                
+                # Buy a new 3M 95% put at stressed spot
+                # But wait — protection puts are typically struck at a FIXED strike (95% of original spot at time of entry)
+                # For the roll cost, though, we assume strikes reset monthly to 95% of current spot
+                # So when underlying moves: new strike = stressed_spot × 0.95, new ATM-95% option
+                new_K = stressed_spot * (K / spot)  # preserve relative moneyness
+                buy_price = bs_price(stressed_spot, new_K, 0.25, RISK_FREE_RATE, DIV_YIELD, iv, opt_type)
+                sell_price = bs_price(stressed_spot, new_K, 2/12, RISK_FREE_RATE, DIV_YIELD, iv, opt_type)
+                per_roll = (buy_price - sell_price) * p["quantity"] * p["multiplier"]
+                annual_cost = per_roll * 12
+                total_protection_cost += annual_cost
+        
+        total_pnl = total_short_pnl + total_lai_opt_pnl - total_protection_cost
+        pnl_pct = total_pnl / gross_exposure if gross_exposure > 0 else np.nan
+        
+        rows.append({
+            "Spot Move": move,
+            "LAI Shorts P&L": total_short_pnl,
+            "LAI Options P&L": total_lai_opt_pnl,
+            "Protection Cost": total_protection_cost,
+            "Total P&L ($)": total_pnl,
+            "Total P&L ($M)": total_pnl / 1e6,
+            "Return on Gross (%)": pnl_pct,
+        })
+    
+    return pd.DataFrame(rows)
+
+
+def _compute_protection_cost(open_positions: list) -> tuple:
+    """Helper to compute annualized protection cost assuming current spot/IV."""
+    total_cost = 0
+    rows = []
+    for p in open_positions:
+        if (p["instrument_type"] == "OPTION"
+            and not is_lai_etf(p["underlying"])
+            and p["quantity"] > 0):
+            spot = p.get("spot")
+            mid = p.get("mid_price")
+            iv = p.get("iv") or 0.20
+            if spot is None or mid is None or mid <= 0:
+                continue
+            K = p["strike"]
+            opt_type = p["option_type"]
+            # Buy 3M → sell 2M — 1M roll
+            buy_price = mid
+            sell_price = bs_price(spot, K, 2/12, RISK_FREE_RATE, DIV_YIELD, iv, opt_type)
+            per_roll = (buy_price - sell_price) * p["quantity"] * p["multiplier"]
+            total_cost += per_roll * 12
+    return rows, total_cost
 
 
 # ========== STRESS SCENARIO ==========

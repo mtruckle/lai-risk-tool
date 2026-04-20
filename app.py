@@ -16,6 +16,7 @@ from market_data import get_spot, realized_vol, compute_beta
 from analytics import (
     enrich_position, portfolio_summary, risk_curve,
     expected_return_table, stress_scenario, steady_state_gross,
+    sensitivity_vol_sweep, sensitivity_spot_sweep,
     STRESS_SCENARIOS,
 )
 from vol_decay import LAI_ETF_MAP, is_lai_etf, get_lai_info
@@ -104,7 +105,7 @@ st.sidebar.caption(f"""
 Data source: Yahoo Finance (15-min delayed)  
 Risk-free: 4.0% | Div yield: 0.5%  
 Vol decay underlying return: 0.0% (fixed)  
-**Build:** 2026-04-20-r2
+**Build:** 2026-04-20-r3
 """)
 
 
@@ -403,29 +404,37 @@ elif page == "📈 Risk Curve":
             mode="lines+markers", name="Gross Delta Exposure",
             line=dict(color="#0A1931", width=3),
             marker=dict(size=7),
+            hovertemplate="<b>%{x:.1f}% SPX</b><br>Gross: $%{y:,.1f}M<extra></extra>",
         ))
         fig1.add_trace(go.Scatter(
             x=spx_x, y=summary_df["Net Delta Exposure"]/1e6,
             mode="lines+markers", name="Net Delta Exposure",
             line=dict(color="#D4A017", width=3),
             marker=dict(size=7),
+            hovertemplate="<b>%{x:.1f}% SPX</b><br>Net Δ: $%{y:,.1f}M<extra></extra>",
         ))
         fig1.add_trace(go.Scatter(
             x=spx_x, y=summary_df["Net Beta-Adj Exposure"]/1e6,
             mode="lines+markers", name="Net Beta-Adj Exposure",
             line=dict(color="#8B0000", width=3, dash="dash"),
             marker=dict(size=7),
+            hovertemplate="<b>%{x:.1f}% SPX</b><br>Net βAdj: $%{y:,.1f}M<extra></extra>",
         ))
         fig1.add_hline(y=0, line_dash="dot", line_color="#AAA")
         fig1.add_vline(x=0, line_dash="dot", line_color="#AAA")
         fig1.update_layout(
             xaxis_title="SPX Move (%)",
             yaxis_title="Exposure ($M)",
-            height=450,
+            height=500,
             hovermode="x unified",
             plot_bgcolor="white",
             paper_bgcolor="white",
-            legend=dict(x=0.02, y=0.98),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom", y=-0.3,
+                xanchor="center", x=0.5,
+            ),
+            margin=dict(b=100),
         )
         fig1.update_xaxes(ticksuffix="%", gridcolor="#EEE")
         fig1.update_yaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
@@ -450,6 +459,7 @@ elif page == "📈 Risk Curve":
                 mode="lines+markers", name="Total Portfolio",
                 line=dict(color="#0A1931", width=3),
                 marker=dict(size=8),
+                hovertemplate="<b>%{x:.1f}% SPX</b><br>Total: $%{y:,.1f}M<extra></extra>",
             ))
         elif granularity_a == "By Beta Direction (Long / Short Beta)":
             fig2.add_trace(go.Scatter(
@@ -457,18 +467,21 @@ elif page == "📈 Risk Curve":
                 mode="lines+markers", name="Long Beta (short SQQQ/SOXS)",
                 line=dict(color="#2E8B57", width=3),
                 marker=dict(size=7),
+                hovertemplate="<b>%{x:.1f}% SPX</b><br>Long β: $%{y:,.1f}M<extra></extra>",
             ))
             fig2.add_trace(go.Scatter(
                 x=spx_x, y=rc["delta_exp_by_direction"]["Short Beta"]/1e6,
                 mode="lines+markers", name="Short Beta (QQQ/SOXX puts)",
                 line=dict(color="#B22222", width=3),
                 marker=dict(size=7),
+                hovertemplate="<b>%{x:.1f}% SPX</b><br>Short β: $%{y:,.1f}M<extra></extra>",
             ))
             fig2.add_trace(go.Scatter(
                 x=spx_x, y=rc["delta_exp_by_direction"]["Total"]/1e6,
                 mode="lines+markers", name="Net",
                 line=dict(color="#0A1931", width=2, dash="dash"),
                 marker=dict(size=6),
+                hovertemplate="<b>%{x:.1f}% SPX</b><br>Net: $%{y:,.1f}M<extra></extra>",
             ))
         else:  # By Instrument
             palette = px.colors.qualitative.Set1 + px.colors.qualitative.Set2
@@ -480,12 +493,14 @@ elif page == "📈 Risk Curve":
                     mode="lines+markers", name=col,
                     line=dict(color=palette[i % len(palette)], width=2),
                     marker=dict(size=5),
+                    hovertemplate=f"<b>%{{x:.1f}}% SPX</b><br>{col}: $%{{y:,.1f}}M<extra></extra>",
                 ))
             fig2.add_trace(go.Scatter(
                 x=spx_x, y=rc["delta_exp_by_position"]["Total"]/1e6,
                 mode="lines+markers", name="Total",
                 line=dict(color="#0A1931", width=3, dash="dash"),
                 marker=dict(size=6),
+                hovertemplate="<b>%{x:.1f}% SPX</b><br>Total: $%{y:,.1f}M<extra></extra>",
             ))
         
         fig2.add_hline(y=0, line_dash="dot", line_color="#AAA")
@@ -493,10 +508,16 @@ elif page == "📈 Risk Curve":
         fig2.update_layout(
             xaxis_title="SPX Move (%)",
             yaxis_title="Delta-Adj Exposure ($M)",
-            height=450,
+            height=500,
             hovermode="x unified",
             plot_bgcolor="white",
             paper_bgcolor="white",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom", y=-0.3,
+                xanchor="center", x=0.5,
+            ),
+            margin=dict(b=100),
         )
         fig2.update_xaxes(ticksuffix="%", gridcolor="#EEE")
         fig2.update_yaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
@@ -522,6 +543,7 @@ elif page == "📈 Risk Curve":
                 line=dict(color="#0A1931", width=3),
                 marker=dict(size=8, color="#D4A017"),
                 fill="tozeroy", fillcolor="rgba(10,25,49,0.1)",
+                hovertemplate="<b>%{x:.1f}% SPX</b><br>P&L: $%{y:,.1f}M<extra></extra>",
             ))
         elif granularity_b == "By Beta Direction (Long / Short Beta)":
             fig3.add_trace(go.Scatter(
@@ -529,18 +551,21 @@ elif page == "📈 Risk Curve":
                 mode="lines+markers", name="Long Beta (short SQQQ/SOXS)",
                 line=dict(color="#2E8B57", width=3),
                 marker=dict(size=7),
+                hovertemplate="<b>%{x:.1f}% SPX</b><br>Long β P&L: $%{y:,.1f}M<extra></extra>",
             ))
             fig3.add_trace(go.Scatter(
                 x=spx_x, y=rc["pnl_by_direction"]["Short Beta"]/1e6,
                 mode="lines+markers", name="Short Beta (QQQ/SOXX puts)",
                 line=dict(color="#B22222", width=3),
                 marker=dict(size=7),
+                hovertemplate="<b>%{x:.1f}% SPX</b><br>Short β P&L: $%{y:,.1f}M<extra></extra>",
             ))
             fig3.add_trace(go.Scatter(
                 x=spx_x, y=rc["pnl_by_direction"]["Total"]/1e6,
                 mode="lines+markers", name="Net Portfolio",
                 line=dict(color="#0A1931", width=2, dash="dash"),
                 marker=dict(size=6),
+                hovertemplate="<b>%{x:.1f}% SPX</b><br>Net P&L: $%{y:,.1f}M<extra></extra>",
             ))
         else:
             palette = px.colors.qualitative.Set1 + px.colors.qualitative.Set2
@@ -552,12 +577,14 @@ elif page == "📈 Risk Curve":
                     mode="lines+markers", name=col,
                     line=dict(color=palette[i % len(palette)], width=2),
                     marker=dict(size=5),
+                    hovertemplate=f"<b>%{{x:.1f}}% SPX</b><br>{col}: $%{{y:,.1f}}M<extra></extra>",
                 ))
             fig3.add_trace(go.Scatter(
                 x=spx_x, y=rc["pnl_by_position"]["Total"]/1e6,
                 mode="lines+markers", name="Total",
                 line=dict(color="#0A1931", width=3, dash="dash"),
                 marker=dict(size=6),
+                hovertemplate="<b>%{x:.1f}% SPX</b><br>Total: $%{y:,.1f}M<extra></extra>",
             ))
         
         fig3.add_hline(y=0, line_dash="dot", line_color="#AAA")
@@ -565,24 +592,50 @@ elif page == "📈 Risk Curve":
         fig3.update_layout(
             xaxis_title="SPX Move (%)",
             yaxis_title="P&L ($M)",
-            height=450,
+            height=500,
             hovermode="x unified",
             plot_bgcolor="white",
             paper_bgcolor="white",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom", y=-0.3,
+                xanchor="center", x=0.5,
+            ),
+            margin=dict(b=100),
         )
         fig3.update_xaxes(ticksuffix="%", gridcolor="#EEE")
         fig3.update_yaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
         st.plotly_chart(fig3, use_container_width=True)
         
         st.markdown("---")
-        st.subheader("Scenario summary table")
-        disp = summary_df.copy()
-        disp["Portfolio P&L"] = disp["Portfolio P&L"].apply(fmt_money)
-        disp["Gross Delta Exposure"] = disp["Gross Delta Exposure"].apply(fmt_money)
-        disp["Net Delta Exposure"] = disp["Net Delta Exposure"].apply(fmt_money)
-        disp["Net Beta-Adj Exposure"] = disp["Net Beta-Adj Exposure"].apply(fmt_money)
-        disp = disp.drop(columns=["SPX Move (decimal)"])
-        st.dataframe(disp, hide_index=True, use_container_width=True)
+        
+        # ========== SECTION 4: Pivoted detail tables ==========
+        st.subheader("Scenario Detail — Per-Instrument × SPX Shock")
+        st.caption("Each metric shown as a separate table with instruments as rows and SPX scenarios as columns.")
+        
+        # Format helper: takes DataFrame (rows=scenarios, cols=instruments + Total)
+        # transposes to (rows=instruments, cols=scenarios) and formats as $M
+        def pivot_for_display(df_scenarios_rows):
+            t = df_scenarios_rows.T  # rows=instruments, cols=scenarios
+            fmt_t = t.applymap(lambda x: f"${x/1e6:,.2f}M" if x >= 0 else f"-${abs(x)/1e6:,.2f}M")
+            fmt_t.index.name = "Instrument"
+            return fmt_t.reset_index()
+        
+        st.markdown("**P&L ($M)** — Portfolio P&L by instrument across SPX shock scenarios")
+        pnl_pivot = pivot_for_display(rc["pnl_by_position"])
+        st.dataframe(pnl_pivot, hide_index=True, use_container_width=True)
+        
+        st.markdown("**Gross Delta Exposure ($M)** — absolute delta-adjusted exposure")
+        gross_pivot = pivot_for_display(rc["gross_delta_by_position"])
+        st.dataframe(gross_pivot, hide_index=True, use_container_width=True)
+        
+        st.markdown("**Net Delta Exposure ($M)** — signed delta-adjusted exposure")
+        net_pivot = pivot_for_display(rc["delta_exp_by_position"])
+        st.dataframe(net_pivot, hide_index=True, use_container_width=True)
+        
+        st.markdown("**Net Beta-Adjusted Exposure ($M)** — signed delta × beta")
+        beta_pivot = pivot_for_display(rc["beta_adj_exp_by_position"])
+        st.dataframe(beta_pivot, hide_index=True, use_container_width=True)
 
 # =========================================================================
 # PAGE: EXPECTED RETURN
@@ -590,45 +643,64 @@ elif page == "📈 Risk Curve":
 elif page == "💰 Expected Return":
     st.title("Expected Return — Vol Decay & Protection Cost")
     st.caption(
-        "Assumes: underlying 1Y return = 0.0% (fixed — isolates vol-decay alpha), "
-        "underlying vol = 260-day realized, constant implied vol. "
-        "LAI options: expected fair value at expiry via decay, annualized CAGR. "
-        "Cash shorts: 1-year expected LAI decay × notional. "
-        "Protection: long non-LAI puts — premium / years-to-expiry."
+        "LAI shorts: compounded daily top-up simulated via Monte Carlo (5,000 paths). "
+        "LAI options: expected fair value at expiry via decay formula, annualized CAGR. "
+        "Protection puts: monthly roll cost × 12 (buy 3M, sell 2M). "
+        "Underlying 1Y return assumption: 0% (isolates vol decay alpha)."
     )
+    
+    # --- Controls ---
+    ctl1, ctl2, ctl3 = st.columns(3)
+    with ctl1:
+        tracking_leverage = st.selectbox(
+            "LAI Tracking Leverage",
+            options=[-3.0, -4.0, -5.0, -6.0],
+            index=0,
+            help="-3x is normal. -4/-5/-6 model stress tracking (e.g. SOXS hit -6x in April 2025).",
+        )
+    with ctl2:
+        mc_paths = st.selectbox(
+            "Monte Carlo paths",
+            options=[1000, 3000, 5000, 10000],
+            index=2,
+            help="More paths = more accurate but slower.",
+        )
+    with ctl3:
+        roll_freq = st.selectbox(
+            "Protection roll frequency (months)",
+            options=[1, 2, 3],
+            index=0,
+        )
     
     enriched = get_enriched_positions()
     if len([p for p in enriched if p["status"] == "OPEN"]) == 0:
         st.info("No open positions.")
     else:
-        with st.spinner("Computing expected returns..."):
-            result = expected_return_table(enriched, r_1y_assumption)
+        with st.spinner(f"Running Monte Carlo ({mc_paths:,} paths per short position)..."):
+            result = expected_return_table(
+                enriched,
+                r_1y_assumption=0.0,
+                use_mc=True,
+                mc_paths=mc_paths,
+                tracking_leverage=tracking_leverage,
+                roll_frequency_months=roll_freq,
+                option_tenor_months=3,
+            )
         
+        # ===== HEADLINE METRICS =====
         st.subheader("Expected Annual $ P&L by Leg")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.metric(
-                "LAI Options (Annual)",
-                fmt_money(result["total_lai_option_annual_usd"]),
-            )
+            st.metric("LAI Options", fmt_money(result["total_lai_option_annual_usd"]))
             st.caption(f"{result['n_lai_options']} positions")
         with c2:
-            st.metric(
-                "Cash Shorts Vol Decay (Annual)",
-                fmt_money(result["total_cash_short_annual_usd"]),
-            )
-            st.caption(f"{result['n_cash_shorts']} positions")
+            st.metric("Cash Shorts (MC compounded)", fmt_money(result["total_cash_short_annual_usd"]))
+            st.caption(f"{result['n_cash_shorts']} positions · simple formula: {fmt_money(result['total_cash_short_simple_usd'])}")
         with c3:
-            st.metric(
-                "Protection Cost (Annual)",
-                fmt_money(-result["total_protection_annual_cost_usd"]),
-            )
-            st.caption(f"{result['n_protection_options']} positions")
+            st.metric("Protection Cost (monthly roll)", fmt_money(-result["total_protection_annual_cost_usd"]))
+            st.caption(f"{result['n_protection_options']} positions · 12 rolls/yr")
         with c4:
-            st.metric(
-                "Net Annual P&L",
-                fmt_money(result["net_annual_pnl_usd"]),
-            )
+            st.metric("Net Annual P&L", fmt_money(result["net_annual_pnl_usd"]))
         
         st.markdown("---")
         
@@ -640,13 +712,12 @@ elif page == "💰 Expected Return":
             st.metric("Net Annual P&L", fmt_money(result["net_annual_pnl_usd"]))
         with c3:
             ret = result["return_on_gross"]
-            st.metric(
-                "Annual Return on Gross",
-                fmt_pct(ret) if ret is not None and not np.isnan(ret) else "—",
-            )
+            st.metric("Annual Return on Gross",
+                      fmt_pct(ret) if ret is not None and not np.isnan(ret) else "—")
         
         st.markdown("---")
         
+        # ===== DETAIL TABLES =====
         if len(result["lai_option_table"]) > 0:
             st.subheader(f"LAI Options ({result['n_lai_options']})")
             t = result["lai_option_table"].copy()
@@ -665,32 +736,108 @@ elif page == "💰 Expected Return":
             st.dataframe(t, hide_index=True, use_container_width=True)
         
         if len(result["cash_short_table"]) > 0:
-            st.subheader(f"Cash Positions — 1Y Vol Decay ({result['n_cash_shorts']})")
+            st.subheader(f"Cash Shorts — Compounded MC vs Simple Formula ({result['n_cash_shorts']})")
             t = result["cash_short_table"].copy()
             t["Underlying Vol"] = t["Underlying Vol"].apply(fmt_pct)
-            t["1Y Expected Decay"] = t["1Y Expected Decay"].apply(fmt_pct)
+            t["1Y Simple Decay"] = t["1Y Simple Decay"].apply(fmt_pct)
             t["Spot"] = t["Spot"].apply(lambda x: fmt_money(x, show_cents=True) if x else "—")
             t["Qty"] = t["Qty"].apply(fmt_int)
             t["Notional ($)"] = t["Notional ($)"].apply(fmt_money)
-            t["Annual P&L ($)"] = t["Annual P&L ($)"].apply(fmt_money)
+            t["Simple $ P&L"] = t["Simple $ P&L"].apply(fmt_money)
+            t["MC Mean $ P&L"] = t["MC Mean $ P&L"].apply(fmt_money)
+            t["MC Median $ P&L"] = t["MC Median $ P&L"].apply(fmt_money)
+            t["MC 5th pct"] = t["MC 5th pct"].apply(fmt_money)
+            t["MC 95th pct"] = t["MC 95th pct"].apply(fmt_money)
             st.dataframe(t, hide_index=True, use_container_width=True)
+            st.caption(
+                "**MC Mean** is the honest expected $ P&L accounting for path-dependent compounding "
+                "(and the right-tail risk where LAI rallies hard). **Median** shows the typical outcome. "
+                "**5th/95th** percentiles show the range of likely outcomes across 5,000 paths."
+            )
         
         if len(result["protection_table"]) > 0:
-            st.subheader(f"Protection (Long Non-LAI Puts) — {result['n_protection_options']}")
+            st.subheader(f"Protection Puts — Monthly Roll ({result['n_protection_options']})")
             t = result["protection_table"].copy()
             t["Strike"] = t["Strike"].apply(lambda x: fmt_money(x, show_cents=True))
-            t["Current Mid"] = t["Current Mid"].apply(lambda x: fmt_money(x, show_cents=True))
+            t["Buy Price"] = t["Buy Price"].apply(lambda x: fmt_money(x, show_cents=True))
+            t["Sell Price (after roll)"] = t["Sell Price (after roll)"].apply(lambda x: fmt_money(x, show_cents=True))
             t["Qty"] = t["Qty"].apply(fmt_int)
-            t["Years to Expiry"] = t["Years to Expiry"].apply(lambda x: f"{x:.2f}")
-            t["Total Premium ($)"] = t["Total Premium ($)"].apply(fmt_money)
+            t["Per-Roll Cost ($)"] = t["Per-Roll Cost ($)"].apply(fmt_money)
             t["Annual Cost ($)"] = t["Annual Cost ($)"].apply(fmt_money)
             st.dataframe(t, hide_index=True, use_container_width=True)
+            st.caption(
+                "Buy 3-month X% put → 1 month later sell 2-month X% put. "
+                "Assumes underlying unchanged, IV constant. Per-roll cost × 12 = annualized drag."
+            )
         
+        st.markdown("---")
+        
+        # ===== SENSITIVITY: VOL SWEEP =====
+        st.subheader("Sensitivity — Underlying Vol Sweep (underlying flat)")
+        st.caption(
+            "Total strategy annual P&L as underlying realized vol varies. "
+            "Spot held constant, MC applied to LAI shorts, LAI options re-valued at each vol."
+        )
+        with st.spinner("Running vol sweep..."):
+            vol_table = sensitivity_vol_sweep(
+                enriched,
+                vol_grid=[0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70],
+                tracking_leverage=tracking_leverage,
+                mc_paths=3000,
+            )
+        if len(vol_table) > 0:
+            # Pivot to wide format: one row, columns = vol levels
+            vol_disp = vol_table.set_index("Vol").T
+            vol_disp.columns = [f"{v*100:.0f}%" for v in vol_disp.columns]
+            # Keep only P&L rows
+            vol_disp = vol_disp.loc[["Total P&L ($M)", "Return on Gross (%)"]].copy()
+            # Format
+            vol_disp_fmt = vol_disp.copy()
+            vol_disp_fmt.loc["Total P&L ($M)"] = vol_disp.loc["Total P&L ($M)"].apply(lambda x: f"${x:,.1f}M" if x >= 0 else f"-${abs(x):,.1f}M")
+            vol_disp_fmt.loc["Return on Gross (%)"] = vol_disp.loc["Return on Gross (%)"].apply(lambda x: fmt_pct(x, 1))
+            vol_disp_fmt.index.name = "Metric"
+            st.dataframe(vol_disp_fmt.reset_index(), hide_index=True, use_container_width=True)
+        
+        st.markdown("---")
+        
+        # ===== SENSITIVITY: SPOT SWEEP =====
+        st.subheader("Sensitivity — Underlying Spot Sweep (vol at current)")
+        st.caption(
+            "Total strategy annual P&L as the underlying moves from -50% to +50% over the year. "
+            "Realized vol held at current 260-day level. LAI shorts: MC with drift matching the move. "
+            "Protection puts: monthly roll cost at stressed spot."
+        )
+        with st.spinner("Running spot sweep..."):
+            spot_table = sensitivity_spot_sweep(
+                enriched,
+                spot_grid=[-0.50, -0.40, -0.30, -0.20, -0.10, 0.0, 0.10, 0.20, 0.30, 0.40, 0.50],
+                tracking_leverage=tracking_leverage,
+                mc_paths=3000,
+            )
+        if len(spot_table) > 0:
+            spot_disp = spot_table.set_index("Spot Move").T
+            spot_disp.columns = [fmt_pct(v, 0) for v in spot_disp.columns]
+            spot_disp = spot_disp.loc[["Total P&L ($M)", "Return on Gross (%)"]].copy()
+            spot_disp_fmt = spot_disp.copy()
+            spot_disp_fmt.loc["Total P&L ($M)"] = spot_disp.loc["Total P&L ($M)"].apply(lambda x: f"${x:,.1f}M" if x >= 0 else f"-${abs(x):,.1f}M")
+            spot_disp_fmt.loc["Return on Gross (%)"] = spot_disp.loc["Return on Gross (%)"].apply(lambda x: fmt_pct(x, 1))
+            spot_disp_fmt.index.name = "Metric"
+            st.dataframe(spot_disp_fmt.reset_index(), hide_index=True, use_container_width=True)
+        
+        st.markdown("---")
         st.info(
-            "**Methodology:** Vol decay formula = `(1 + r_1y)^L × exp((L − L²) × σ² × T / 2) − 1`. "
-            "LAI options: fair value at expiry = `max(K − expected_spot, 0)`. "
-            "Cash shorts: `annual_pnl = -decay_1y × notional` for short positions. "
-            "Protection cost: `premium / years_to_expiry`."
+            "**Methodology notes:**\n\n"
+            "1. **Simple vol decay formula** (reference): `(1 + r)^L × exp((L − L²) × σ² × T / 2) − 1` — gives "
+            "expected log decay of the LAI ETF. Applied to short $ notional gives the naive expected P&L.\n\n"
+            "2. **Monte Carlo compounded short**: simulates the underlying as GBM, mechanically applies "
+            "tracking leverage to get LAI daily returns, and applies the daily top-up rule "
+            "(if short MV < target, top up to target; otherwise ride). Captures path dependence. "
+            "Mean P&L is typically much lower than the simple formula due to right-tail risk.\n\n"
+            "3. **Protection roll cost**: 3M 95% put bought, 1 month later sold as a 2M 95% put "
+            "(assuming spot unchanged). Per-roll cost = buy − sell. Annualized cost = per-roll × 12.\n\n"
+            "4. **Tracking leverage** defaults to -3x but is adjustable. In Covid 2020 and April 2025 "
+            "Liberation Day, realized tracking was closer to -6x for SOXS (reflects the leveraged ETF's "
+            "mechanical behavior during extreme single-direction moves)."
         )
 
 # =========================================================================
