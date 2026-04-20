@@ -32,12 +32,29 @@ st.set_page_config(
 init_db()
 
 # -------------------------------------------------------------------------
-st.markdown("""
+BUILD_VERSION = "2026-04-20-r5"
+
+st.markdown(f"""
 <style>
-    .main { padding-top: 1rem; }
-    h1, h2, h3 { color: #0A1931; font-family: Georgia, serif; }
-    [data-testid="stMetricValue"] { font-size: 24px; }
+    .main {{ padding-top: 1rem; }}
+    h1, h2, h3 {{ color: #0A1931; font-family: Georgia, serif; }}
+    [data-testid="stMetricValue"] {{ font-size: 24px; }}
+    .build-badge {{
+        position: fixed;
+        top: 0.5rem;
+        right: 1rem;
+        z-index: 999999;
+        background: #0A1931;
+        color: #D4A017;
+        padding: 0.3rem 0.8rem;
+        border-radius: 6px;
+        font-family: 'Consolas', 'Monaco', monospace;
+        font-size: 12px;
+        font-weight: bold;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+    }}
 </style>
+<div class="build-badge">Build: {BUILD_VERSION}</div>
 """, unsafe_allow_html=True)
 
 # -------------------------------------------------------------------------
@@ -105,7 +122,7 @@ st.sidebar.caption(f"""
 Data source: Yahoo Finance (15-min delayed)  
 Risk-free: 4.0% | Div yield: 0.5%  
 Vol decay underlying return: 0.0% (fixed)  
-**Build:** 2026-04-20-r4
+**Build:** {BUILD_VERSION}
 """)
 
 
@@ -617,7 +634,14 @@ elif page == "📈 Risk Curve":
         # transposes to (rows=instruments, cols=scenarios) and formats as $M
         def pivot_for_display(df_scenarios_rows):
             t = df_scenarios_rows.T  # rows=instruments, cols=scenarios
-            fmt_t = t.applymap(lambda x: f"${x/1e6:,.2f}M" if x >= 0 else f"-${abs(x)/1e6:,.2f}M")
+            # Use .map on DataFrame (pandas 2.x replaces .applymap)
+            def fmt_cell(x):
+                if x is None or (isinstance(x, float) and np.isnan(x)):
+                    return "—"
+                return f"${x/1e6:,.2f}M" if x >= 0 else f"-${abs(x)/1e6:,.2f}M"
+            fmt_t = t.copy()
+            for col in fmt_t.columns:
+                fmt_t[col] = fmt_t[col].apply(fmt_cell)
             fmt_t.index.name = "Instrument"
             return fmt_t.reset_index()
         
@@ -852,17 +876,16 @@ elif page == "💰 Expected Return":
                 mc_paths=3000,
             )
         if len(vol_table) > 0:
-            # Pivot to wide format: one row, columns = vol levels
-            vol_disp = vol_table.set_index("Vol").T
-            vol_disp.columns = [f"{v*100:.0f}%" for v in vol_disp.columns]
-            # Keep only P&L rows
-            vol_disp = vol_disp.loc[["Total P&L ($M)", "Return on Gross (%)"]].copy()
-            # Format
-            vol_disp_fmt = vol_disp.copy()
-            vol_disp_fmt.loc["Total P&L ($M)"] = vol_disp.loc["Total P&L ($M)"].apply(lambda x: f"${x:,.1f}M" if x >= 0 else f"-${abs(x):,.1f}M")
-            vol_disp_fmt.loc["Return on Gross (%)"] = vol_disp.loc["Return on Gross (%)"].apply(lambda x: fmt_pct(x, 1))
-            vol_disp_fmt.index.name = "Metric"
-            st.dataframe(vol_disp_fmt.reset_index(), hide_index=True, use_container_width=True)
+            # Build display as plain dict-rows to avoid pandas mixed-dtype issues
+            vol_cols = [f"{v*100:.0f}%" for v in vol_table["Vol"]]
+            pnl_row = {"Metric": "Total P&L ($M)"}
+            ret_row = {"Metric": "Return on Gross (%)"}
+            for i, col in enumerate(vol_cols):
+                x = vol_table["Total P&L ($M)"].iloc[i]
+                pnl_row[col] = f"${x:,.1f}M" if x >= 0 else f"-${abs(x):,.1f}M"
+                ret_row[col] = fmt_pct(vol_table["Return on Gross (%)"].iloc[i], 1)
+            vol_display_df = pd.DataFrame([pnl_row, ret_row])
+            st.dataframe(vol_display_df, hide_index=True, use_container_width=True)
         
         st.markdown("---")
         
@@ -881,14 +904,15 @@ elif page == "💰 Expected Return":
                 mc_paths=3000,
             )
         if len(spot_table) > 0:
-            spot_disp = spot_table.set_index("Spot Move").T
-            spot_disp.columns = [fmt_pct(v, 0) for v in spot_disp.columns]
-            spot_disp = spot_disp.loc[["Total P&L ($M)", "Return on Gross (%)"]].copy()
-            spot_disp_fmt = spot_disp.copy()
-            spot_disp_fmt.loc["Total P&L ($M)"] = spot_disp.loc["Total P&L ($M)"].apply(lambda x: f"${x:,.1f}M" if x >= 0 else f"-${abs(x):,.1f}M")
-            spot_disp_fmt.loc["Return on Gross (%)"] = spot_disp.loc["Return on Gross (%)"].apply(lambda x: fmt_pct(x, 1))
-            spot_disp_fmt.index.name = "Metric"
-            st.dataframe(spot_disp_fmt.reset_index(), hide_index=True, use_container_width=True)
+            spot_cols = [fmt_pct(v, 0) for v in spot_table["Spot Move"]]
+            pnl_row = {"Metric": "Total P&L ($M)"}
+            ret_row = {"Metric": "Return on Gross (%)"}
+            for i, col in enumerate(spot_cols):
+                x = spot_table["Total P&L ($M)"].iloc[i]
+                pnl_row[col] = f"${x:,.1f}M" if x >= 0 else f"-${abs(x):,.1f}M"
+                ret_row[col] = fmt_pct(spot_table["Return on Gross (%)"].iloc[i], 1)
+            spot_display_df = pd.DataFrame([pnl_row, ret_row])
+            st.dataframe(spot_display_df, hide_index=True, use_container_width=True)
         
         st.markdown("---")
         st.info(
