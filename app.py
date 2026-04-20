@@ -103,7 +103,8 @@ r_1y_assumption = 0.0
 st.sidebar.caption(f"""
 Data source: Yahoo Finance (15-min delayed)  
 Risk-free: 4.0% | Div yield: 0.5%  
-Vol decay underlying return: 0.0% (fixed)
+Vol decay underlying return: 0.0% (fixed)  
+**Build:** 2026-04-20-r2
 """)
 
 
