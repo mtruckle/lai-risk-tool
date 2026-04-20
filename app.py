@@ -105,7 +105,7 @@ st.sidebar.caption(f"""
 Data source: Yahoo Finance (15-min delayed)  
 Risk-free: 4.0% | Div yield: 0.5%  
 Vol decay underlying return: 0.0% (fixed)  
-**Build:** 2026-04-20-r3
+**Build:** 2026-04-20-r4
 """)
 
 
@@ -694,13 +694,19 @@ elif page == "💰 Expected Return":
             st.metric("LAI Options", fmt_money(result["total_lai_option_annual_usd"]))
             st.caption(f"{result['n_lai_options']} positions")
         with c2:
-            st.metric("Cash Shorts (MC compounded)", fmt_money(result["total_cash_short_annual_usd"]))
+            st.metric("Cash Shorts (MC median)", fmt_money(result["total_cash_short_annual_usd"]))
             st.caption(f"{result['n_cash_shorts']} positions · simple formula: {fmt_money(result['total_cash_short_simple_usd'])}")
         with c3:
             st.metric("Protection Cost (monthly roll)", fmt_money(-result["total_protection_annual_cost_usd"]))
             st.caption(f"{result['n_protection_options']} positions · 12 rolls/yr")
         with c4:
             st.metric("Net Annual P&L", fmt_money(result["net_annual_pnl_usd"]))
+        
+        st.info(
+            "**Cash shorts use MONTE CARLO MEDIAN** as the primary metric. The mean is distorted "
+            "by a small number of catastrophic tail paths where the LAI rallies 500%+ in a year. "
+            "Median represents the TYPICAL outcome across paths. See the distribution below."
+        )
         
         st.markdown("---")
         
@@ -737,7 +743,10 @@ elif page == "💰 Expected Return":
         
         if len(result["cash_short_table"]) > 0:
             st.subheader(f"Cash Shorts — Compounded MC vs Simple Formula ({result['n_cash_shorts']})")
-            t = result["cash_short_table"].copy()
+            
+            # Build display copy (drop the internal distribution column for table display)
+            raw = result["cash_short_table"].copy()
+            t = raw.drop(columns=["_mc_all_pnl"]).copy()
             t["Underlying Vol"] = t["Underlying Vol"].apply(fmt_pct)
             t["1Y Simple Decay"] = t["1Y Simple Decay"].apply(fmt_pct)
             t["Spot"] = t["Spot"].apply(lambda x: fmt_money(x, show_cents=True) if x else "—")
@@ -748,12 +757,69 @@ elif page == "💰 Expected Return":
             t["MC Median $ P&L"] = t["MC Median $ P&L"].apply(fmt_money)
             t["MC 5th pct"] = t["MC 5th pct"].apply(fmt_money)
             t["MC 95th pct"] = t["MC 95th pct"].apply(fmt_money)
+            t["MC Win Rate"] = t["MC Win Rate"].apply(lambda x: fmt_pct(x, 1))
             st.dataframe(t, hide_index=True, use_container_width=True)
             st.caption(
-                "**MC Mean** is the honest expected $ P&L accounting for path-dependent compounding "
-                "(and the right-tail risk where LAI rallies hard). **Median** shows the typical outcome. "
-                "**5th/95th** percentiles show the range of likely outcomes across 5,000 paths."
+                "**Median** = typical outcome (used as primary metric — robust to tails). "
+                "**Mean** = average including extreme tail paths (distorted by rare LAI mega-rallies). "
+                "**Win Rate** = % of paths with positive P&L. **5th/95th** = range of typical outcomes."
             )
+            
+            # ===== DISTRIBUTION HISTOGRAMS =====
+            st.markdown("##### Distribution of Outcomes per Position")
+            st.caption(
+                "Each histogram shows the full distribution of P&L across all Monte Carlo paths. "
+                "You can see why the mean differs from median — the left tail (catastrophic rallies) "
+                "drags the mean down. Vertical lines: median (green), mean (orange), 5/95 pct (dashed gray)."
+            )
+            
+            for _, row in raw.iterrows():
+                ticker = row["Ticker"]
+                all_pnl = row.get("_mc_all_pnl")
+                if all_pnl is None or (hasattr(all_pnl, "__len__") and len(all_pnl) == 0):
+                    continue
+                
+                # Convert to $M for plotting
+                pnl_m = np.array(all_pnl) / 1e6
+                
+                fig_hist = go.Figure()
+                fig_hist.add_trace(go.Histogram(
+                    x=pnl_m,
+                    nbinsx=80,
+                    marker_color="#0A1931",
+                    opacity=0.75,
+                    name=ticker,
+                    hovertemplate="P&L: $%{x:.1f}M<br>Paths: %{y}<extra></extra>",
+                ))
+                
+                median_m = row["MC Median $ P&L"] / 1e6
+                mean_m = row["MC Mean $ P&L"] / 1e6
+                p5_m = row["MC 5th pct"] / 1e6
+                p95_m = row["MC 95th pct"] / 1e6
+                
+                fig_hist.add_vline(x=median_m, line_dash="solid", line_color="#2E8B57", line_width=3,
+                                    annotation_text=f"Median ${median_m:,.1f}M", annotation_position="top")
+                fig_hist.add_vline(x=mean_m, line_dash="solid", line_color="#D4A017", line_width=3,
+                                    annotation_text=f"Mean ${mean_m:,.1f}M", annotation_position="top right")
+                fig_hist.add_vline(x=p5_m, line_dash="dash", line_color="#888", line_width=1,
+                                    annotation_text=f"5% ${p5_m:,.1f}M", annotation_position="bottom")
+                fig_hist.add_vline(x=p95_m, line_dash="dash", line_color="#888", line_width=1,
+                                    annotation_text=f"95% ${p95_m:,.1f}M", annotation_position="bottom")
+                fig_hist.add_vline(x=0, line_dash="dot", line_color="#B22222", line_width=2)
+                
+                fig_hist.update_layout(
+                    title=f"{ticker} — Distribution of 1Y P&L across {mc_paths:,} paths",
+                    xaxis_title="Annual P&L ($M)",
+                    yaxis_title="# of Paths",
+                    height=400,
+                    plot_bgcolor="white",
+                    paper_bgcolor="white",
+                    showlegend=False,
+                    bargap=0.02,
+                )
+                fig_hist.update_xaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
+                fig_hist.update_yaxes(gridcolor="#EEE")
+                st.plotly_chart(fig_hist, use_container_width=True)
         
         if len(result["protection_table"]) > 0:
             st.subheader(f"Protection Puts — Monthly Roll ({result['n_protection_options']})")

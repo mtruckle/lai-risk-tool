@@ -95,6 +95,7 @@ def simulate_compounded_short(
     p25 = float(np.percentile(cum_pnl, 25))
     p75 = float(np.percentile(cum_pnl, 75))
     p95 = float(np.percentile(cum_pnl, 95))
+    win_rate = float((cum_pnl > 0).mean())
     
     return {
         "mean_pnl": mean_pnl,
@@ -104,11 +105,14 @@ def simulate_compounded_short(
         "p75": p75,
         "p95": p95,
         "mean_pnl_pct": mean_pnl / target_notional,
+        "median_pnl_pct": median_pnl / target_notional,
+        "win_rate": win_rate,
         "n_paths": n_paths,
         "horizon_days": horizon_days,
         "target_notional": target_notional,
         "underlying_vol": underlying_vol,
         "tracking_leverage": tracking_leverage,
+        "all_pnl": cum_pnl,  # full distribution for plotting
     }
 
 

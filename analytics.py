@@ -571,6 +571,8 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
             mc_median = np.nan
             mc_p5 = np.nan
             mc_p95 = np.nan
+            mc_all_pnl = None
+            mc_win_rate = np.nan
             if use_mc and qty < 0:  # only for shorts (strategy doesn't apply to longs)
                 mc_result = simulate_compounded_short(
                     target_notional=notional,
@@ -585,9 +587,11 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
                 mc_median = mc_result["median_pnl"]
                 mc_p5 = mc_result["p5"]
                 mc_p95 = mc_result["p95"]
-                total_cash_short_annual_usd += mc_mean
+                mc_all_pnl = mc_result["all_pnl"]
+                mc_win_rate = mc_result["win_rate"]
+                # USE MEDIAN as the aggregated figure (more robust than mean)
+                total_cash_short_annual_usd += mc_median
             else:
-                # Fallback: use simple formula
                 total_cash_short_annual_usd += simple_pnl
             
             cash_short_rows.append({
@@ -603,6 +607,8 @@ def expected_return_table(enriched_positions: list, r_1y_assumption=0.0, asof_da
                 "MC Median $ P&L": mc_median,
                 "MC 5th pct": mc_p5,
                 "MC 95th pct": mc_p95,
+                "MC Win Rate": mc_win_rate,
+                "_mc_all_pnl": mc_all_pnl,  # for histogram plotting
             })
         
         # ===== OPTION POSITIONS =====
@@ -758,7 +764,7 @@ def sensitivity_vol_sweep(enriched_positions: list,
                         n_paths=mc_paths,
                         seed=42,
                     )
-                    total_short_pnl += r["mean_pnl"]
+                    total_short_pnl += r["median_pnl"]
             
             elif p["instrument_type"] == "OPTION" and is_lai_etf(p["underlying"]):
                 lai_info = get_lai_info(p["underlying"])
@@ -829,7 +835,7 @@ def sensitivity_spot_sweep(enriched_positions: list,
                         n_paths=mc_paths,
                         seed=42,
                     )
-                    total_short_pnl += r["mean_pnl"]
+                    total_short_pnl += r["median_pnl"]
             
             elif p["instrument_type"] == "OPTION" and is_lai_etf(p["underlying"]):
                 # LAI options: recompute expected return with underlying moving `move` over 1y
