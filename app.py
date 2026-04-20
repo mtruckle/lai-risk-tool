@@ -1,5 +1,5 @@
 """
-LAI Risk Management Tool — Streamlit App
+LAI Risk Management Tool — Streamlit App (v2)
 
 Run locally:  streamlit run app.py
 """
@@ -31,22 +31,52 @@ st.set_page_config(
 init_db()
 
 # -------------------------------------------------------------------------
-# CUSTOM CSS for a cleaner institutional look
 st.markdown("""
 <style>
     .main { padding-top: 1rem; }
-    .metric-card {
-        background: #f8f9fa;
-        padding: 1rem;
-        border-radius: 8px;
-        border-left: 4px solid #0A1931;
-    }
-    .loss { color: #B22222; font-weight: bold; }
-    .gain { color: #2E8B57; font-weight: bold; }
     h1, h2, h3 { color: #0A1931; font-family: Georgia, serif; }
     [data-testid="stMetricValue"] { font-size: 24px; }
 </style>
 """, unsafe_allow_html=True)
+
+# -------------------------------------------------------------------------
+# HELPERS
+def fmt_money(x, show_cents=False):
+    """Format $ amount with comma separators. Minus sign before $ for negatives.
+    Examples: $1,310,000  |  -$1,310,000  |  $5.25  |  -$0.75"""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    try:
+        x = float(x)
+    except (ValueError, TypeError):
+        return "—"
+    if show_cents:
+        if x < 0:
+            return f"-${abs(x):,.2f}"
+        return f"${x:,.2f}"
+    if x < 0:
+        return f"-${abs(x):,.0f}"
+    return f"${x:,.0f}"
+
+
+def fmt_int(x):
+    """Integer with comma separators; preserves negative sign."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    try:
+        return f"{float(x):,.0f}"
+    except (ValueError, TypeError):
+        return str(x)
+
+
+def fmt_pct(x, digits=2):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    try:
+        return f"{float(x)*100:.{digits}f}%"
+    except (ValueError, TypeError):
+        return "—"
+
 
 # -------------------------------------------------------------------------
 # SIDEBAR
@@ -78,36 +108,15 @@ Risk-free: 4.0% | Div yield: 0.5%
 
 
 # -------------------------------------------------------------------------
-# HELPERS
 @st.cache_data(ttl=60, show_spinner=False)
 def get_enriched_positions(_trigger_refresh=0):
-    """Enrich all positions. _trigger_refresh lets us invalidate cache."""
     raw = get_positions()
     enriched = [enrich_position(p) for p in raw]
     return enriched
 
 
 def refresh_data():
-    """Clear cache to force data refresh."""
     get_enriched_positions.clear()
-
-
-def fmt_money(x, millions=False):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "—"
-    if millions:
-        return f"${x/1e6:,.2f}M"
-    if abs(x) >= 1e6:
-        return f"${x/1e6:,.2f}M"
-    if abs(x) >= 1e3:
-        return f"${x/1e3:,.1f}k"
-    return f"${x:,.2f}"
-
-
-def fmt_pct(x, digits=2):
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return "—"
-    return f"{x*100:.{digits}f}%"
 
 
 # =========================================================================
@@ -144,7 +153,7 @@ if page == "📋 Positions":
                 with c1:
                     st.write(f"**Underlying:** {parsed['underlying']}")
                     if parsed["instrument_type"] == "OPTION":
-                        st.write(f"**Strike:** ${parsed['strike']}")
+                        st.write(f"**Strike:** {fmt_money(parsed['strike'], show_cents=True)}")
                 with c2:
                     if parsed["instrument_type"] == "OPTION":
                         st.write(f"**Expiry:** {parsed['expiry']}")
@@ -200,34 +209,23 @@ if page == "📋 Positions":
         if not open_pos:
             st.info("No open positions. Add one in the 'Add Position' tab.")
         else:
-            # Display table
             df_rows = []
             for p in open_pos:
                 df_rows.append({
                     "ID": p["id"],
                     "Ticker": p["bbg_ticker"],
                     "Type": p["instrument_type"],
-                    "Qty": p["quantity"],
-                    "Mult": p["multiplier"],
-                    "Entry": p["entry_price"],
-                    "Mid/Spot": p.get("mid_price"),
-                    "IV": f"{p.get('iv')*100:.1f}%" if p.get("iv") else "—",
-                    "Δ": f"{p.get('delta', 0):.3f}",
-                    "MV": p.get("market_value", 0),
-                    "Unreal. P&L": p.get("unrealized_pnl", 0),
+                    "Qty": fmt_int(p["quantity"]),
+                    "Mult": fmt_int(p["multiplier"]),
+                    "Entry": fmt_money(p["entry_price"], show_cents=True),
+                    "Mid/Spot": fmt_money(p.get("mid_price"), show_cents=True),
+                    "IV": fmt_pct(p.get("iv"), 1) if p.get("iv") else "—",
+                    "Delta": f"{p.get('delta', 0):.3f}",
+                    "Market Value": fmt_money(p.get("market_value", 0)),
+                    "Unrealized P&L": fmt_money(p.get("unrealized_pnl", 0)),
                 })
             df = pd.DataFrame(df_rows)
-            st.dataframe(
-                df,
-                hide_index=True,
-                use_container_width=True,
-                column_config={
-                    "MV": st.column_config.NumberColumn(format="$%.0f"),
-                    "Unreal. P&L": st.column_config.NumberColumn(format="$%.0f"),
-                    "Entry": st.column_config.NumberColumn(format="$%.2f"),
-                    "Mid/Spot": st.column_config.NumberColumn(format="$%.2f"),
-                },
-            )
+            st.dataframe(df, hide_index=True, use_container_width=True)
             
             st.markdown("---")
             st.subheader("Close or delete a position")
@@ -238,7 +236,7 @@ if page == "📋 Positions":
             selected = next((p for p in open_pos if p["id"] == pos_id), None)
             if selected:
                 with col2:
-                    st.write(f"**{selected['bbg_ticker']}** — Qty: {selected['quantity']}, Entry: ${selected['entry_price']}")
+                    st.write(f"**{selected['bbg_ticker']}** — Qty: {fmt_int(selected['quantity'])}, Entry: {fmt_money(selected['entry_price'], show_cents=True)}")
                 
                 cc1, cc2, cc3, cc4 = st.columns(4)
                 with cc1:
@@ -259,7 +257,7 @@ if page == "📋 Positions":
                         st.success(f"Position #{pos_id} closed.")
                         st.rerun()
                 with cc4:
-                    if st.button("🗑️ Delete", help="Permanently delete (no history kept)"):
+                    if st.button("🗑️ Delete", help="Permanently delete"):
                         delete_position(pos_id)
                         refresh_data()
                         st.warning(f"Position #{pos_id} deleted.")
@@ -281,20 +279,15 @@ if page == "📋 Positions":
                 df_rows.append({
                     "ID": p["id"],
                     "Ticker": p["bbg_ticker"],
-                    "Qty": p["quantity"],
-                    "Entry": p["entry_price"],
+                    "Qty": fmt_int(p["quantity"]),
+                    "Entry": fmt_money(p["entry_price"], show_cents=True),
                     "Entry Date": p["entry_date"],
-                    "Exit": p.get("exit_price"),
+                    "Exit": fmt_money(p.get("exit_price"), show_cents=True),
                     "Exit Date": p.get("exit_date"),
-                    "Realized P&L": rp,
+                    "Realized P&L": fmt_money(rp),
                 })
             df = pd.DataFrame(df_rows)
-            st.dataframe(df, hide_index=True, use_container_width=True,
-                         column_config={
-                             "Realized P&L": st.column_config.NumberColumn(format="$%.0f"),
-                             "Entry": st.column_config.NumberColumn(format="$%.2f"),
-                             "Exit": st.column_config.NumberColumn(format="$%.2f"),
-                         })
+            st.dataframe(df, hide_index=True, use_container_width=True)
             st.metric("Total Realized P&L", fmt_money(total_realized))
 
 # =========================================================================
@@ -309,7 +302,6 @@ elif page == "📊 Summary":
     if summary["n_open_positions"] == 0:
         st.info("No open positions. Add positions on the Positions page.")
     else:
-        # Top-level metrics
         st.subheader("Portfolio metrics")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
@@ -325,23 +317,25 @@ elif page == "📊 Summary":
         st.subheader("Portfolio Greeks")
         g1, g2, g3, g4 = st.columns(4)
         with g1:
-            st.metric("Total Δ (shares)", f"{summary['total_delta']:,.0f}")
+            st.metric("Total Delta (shares)", fmt_int(summary['total_delta']))
+            st.caption("Net share-equivalent exposure")
         with g2:
-            st.metric("Total Γ", f"{summary['total_gamma']:,.2f}")
+            st.metric("Total Gamma", f"{summary['total_gamma']:,.2f}")
+            st.caption("Change in delta per $1 move")
         with g3:
             theta_day = summary["total_theta"] / 365
-            st.metric("Total Θ (per day)", fmt_money(theta_day))
+            st.metric("Total Theta (per day)", fmt_money(theta_day))
+            st.caption("Daily time decay in $")
         with g4:
             vega_vol_pt = summary["total_vega"] / 100
             st.metric("Total Vega (per vol pt)", fmt_money(vega_vol_pt))
+            st.caption("P&L per 1 vol point change")
         
         st.markdown("---")
         
-        # P&L
         st.subheader("P&L")
         p1, p2, p3 = st.columns(3)
         with p1:
-            delta = "↑" if summary["unrealized_pnl"] >= 0 else "↓"
             st.metric("Unrealized P&L", fmt_money(summary["unrealized_pnl"]))
         with p2:
             st.metric("Realized P&L", fmt_money(summary["realized_pnl"]))
@@ -350,7 +344,6 @@ elif page == "📊 Summary":
         
         st.markdown("---")
         
-        # By underlying
         st.subheader("By underlying")
         by_und = summary["by_underlying"]
         if by_und:
@@ -359,25 +352,15 @@ elif page == "📊 Summary":
                 rows.append({
                     "Underlying": u,
                     "# Positions": data["n_positions"],
-                    "Option Premium": data["option_premium"],
-                    "Gross Notional": data["gross_notional"],
-                    "Delta Exposure": data["delta_exposure"],
-                    "Beta-Adj Exposure": data["beta_adj_exposure"],
-                    "Unrealized P&L": data["unrealized_pnl"],
+                    "Option Premium": fmt_money(data["option_premium"]),
+                    "Gross Notional": fmt_money(data["gross_notional"]),
+                    "Delta Exposure": fmt_money(data["delta_exposure"]),
+                    "Beta-Adj Exposure": fmt_money(data["beta_adj_exposure"]),
+                    "Unrealized P&L": fmt_money(data["unrealized_pnl"]),
                 })
             df = pd.DataFrame(rows)
-            st.dataframe(
-                df, hide_index=True, use_container_width=True,
-                column_config={
-                    "Option Premium": st.column_config.NumberColumn(format="$%.0f"),
-                    "Gross Notional": st.column_config.NumberColumn(format="$%.0f"),
-                    "Delta Exposure": st.column_config.NumberColumn(format="$%.0f"),
-                    "Beta-Adj Exposure": st.column_config.NumberColumn(format="$%.0f"),
-                    "Unrealized P&L": st.column_config.NumberColumn(format="$%.0f"),
-                },
-            )
+            st.dataframe(df, hide_index=True, use_container_width=True)
             
-            # Premium pie by underlying
             if len(by_und) > 1:
                 pie_df = pd.DataFrame([
                     {"Underlying": u, "Premium": abs(d["option_premium"])}
@@ -394,9 +377,9 @@ elif page == "📊 Summary":
 elif page == "📈 Risk Curve":
     st.title("Risk Curve — SPX Scenario Analysis")
     st.caption(
-        "Portfolio P&L by SPX move (-15% to +15% in 2.5% increments). "
-        "Each position repriced via Black-Scholes assuming implied vol is unchanged. "
-        "Leveraged/inverse ETFs move at their actual multiplier × underlying beta × SPX move."
+        "Portfolio sensitivity to SPX moves (-15% to +15% in 2.5% increments). "
+        "Options repriced via Black-Scholes assuming IV unchanged. "
+        "LAI ETFs move at leverage × underlying beta × SPX move."
     )
     
     enriched = get_enriched_positions()
@@ -406,53 +389,211 @@ elif page == "📈 Risk Curve":
         with st.spinner("Computing risk curve..."):
             rc = risk_curve(enriched)
         
-        # Chart
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=rc["SPX Move (decimal)"] * 100,
-            y=rc["Portfolio P&L ($)"] / 1e6,
-            mode="lines+markers",
+        summary_df = rc["summary_df"]
+        spx_x = summary_df["SPX Move (decimal)"] * 100
+        
+        # ========== SECTION 1: Exposure curve ==========
+        st.subheader("Exposure under SPX shock")
+        st.caption("Gross, net, and net beta-adjusted delta exposures as SPX moves.")
+        
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(
+            x=spx_x, y=summary_df["Gross Delta Exposure"]/1e6,
+            mode="lines+markers", name="Gross Delta Exposure",
             line=dict(color="#0A1931", width=3),
-            marker=dict(size=8, color="#D4A017"),
-            name="Portfolio P&L",
+            marker=dict(size=7),
         ))
-        fig.add_hline(y=0, line_dash="dash", line_color="#888")
-        fig.add_vline(x=0, line_dash="dash", line_color="#888")
-        fig.update_layout(
+        fig1.add_trace(go.Scatter(
+            x=spx_x, y=summary_df["Net Delta Exposure"]/1e6,
+            mode="lines+markers", name="Net Delta Exposure",
+            line=dict(color="#D4A017", width=3),
+            marker=dict(size=7),
+        ))
+        fig1.add_trace(go.Scatter(
+            x=spx_x, y=summary_df["Net Beta-Adj Exposure"]/1e6,
+            mode="lines+markers", name="Net Beta-Adj Exposure",
+            line=dict(color="#8B0000", width=3, dash="dash"),
+            marker=dict(size=7),
+        ))
+        fig1.add_hline(y=0, line_dash="dot", line_color="#AAA")
+        fig1.add_vline(x=0, line_dash="dot", line_color="#AAA")
+        fig1.update_layout(
             xaxis_title="SPX Move (%)",
-            yaxis_title="Portfolio P&L ($M)",
-            height=500,
+            yaxis_title="Exposure ($M)",
+            height=450,
             hovermode="x unified",
-            showlegend=False,
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            legend=dict(x=0.02, y=0.98),
+        )
+        fig1.update_xaxes(ticksuffix="%", gridcolor="#EEE")
+        fig1.update_yaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
+        st.plotly_chart(fig1, use_container_width=True)
+        
+        st.markdown("---")
+        
+        # ========== SECTION 2: Delta-Adj Exposure with granularity ==========
+        st.subheader("Delta-Adjusted Exposure under SPX shock")
+        
+        granularity_a = st.selectbox(
+            "Granularity",
+            ["Total Portfolio", "By Beta Direction (Long / Short Beta)", "By Instrument"],
+            key="granularity_delta",
+        )
+        
+        fig2 = go.Figure()
+        
+        if granularity_a == "Total Portfolio":
+            fig2.add_trace(go.Scatter(
+                x=spx_x, y=rc["delta_exp_by_direction"]["Total"]/1e6,
+                mode="lines+markers", name="Total Portfolio",
+                line=dict(color="#0A1931", width=3),
+                marker=dict(size=8),
+            ))
+        elif granularity_a == "By Beta Direction (Long / Short Beta)":
+            fig2.add_trace(go.Scatter(
+                x=spx_x, y=rc["delta_exp_by_direction"]["Long Beta"]/1e6,
+                mode="lines+markers", name="Long Beta (short SQQQ/SOXS)",
+                line=dict(color="#2E8B57", width=3),
+                marker=dict(size=7),
+            ))
+            fig2.add_trace(go.Scatter(
+                x=spx_x, y=rc["delta_exp_by_direction"]["Short Beta"]/1e6,
+                mode="lines+markers", name="Short Beta (QQQ/SOXX puts)",
+                line=dict(color="#B22222", width=3),
+                marker=dict(size=7),
+            ))
+            fig2.add_trace(go.Scatter(
+                x=spx_x, y=rc["delta_exp_by_direction"]["Total"]/1e6,
+                mode="lines+markers", name="Net",
+                line=dict(color="#0A1931", width=2, dash="dash"),
+                marker=dict(size=6),
+            ))
+        else:  # By Instrument
+            palette = px.colors.qualitative.Set1 + px.colors.qualitative.Set2
+            for i, col in enumerate(rc["delta_exp_by_position"].columns):
+                if col == "Total":
+                    continue
+                fig2.add_trace(go.Scatter(
+                    x=spx_x, y=rc["delta_exp_by_position"][col]/1e6,
+                    mode="lines+markers", name=col,
+                    line=dict(color=palette[i % len(palette)], width=2),
+                    marker=dict(size=5),
+                ))
+            fig2.add_trace(go.Scatter(
+                x=spx_x, y=rc["delta_exp_by_position"]["Total"]/1e6,
+                mode="lines+markers", name="Total",
+                line=dict(color="#0A1931", width=3, dash="dash"),
+                marker=dict(size=6),
+            ))
+        
+        fig2.add_hline(y=0, line_dash="dot", line_color="#AAA")
+        fig2.add_vline(x=0, line_dash="dot", line_color="#AAA")
+        fig2.update_layout(
+            xaxis_title="SPX Move (%)",
+            yaxis_title="Delta-Adj Exposure ($M)",
+            height=450,
+            hovermode="x unified",
             plot_bgcolor="white",
             paper_bgcolor="white",
         )
-        fig.update_xaxes(ticksuffix="%", gridcolor="#EEE")
-        fig.update_yaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
-        st.plotly_chart(fig, use_container_width=True)
+        fig2.update_xaxes(ticksuffix="%", gridcolor="#EEE")
+        fig2.update_yaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
+        st.plotly_chart(fig2, use_container_width=True)
         
-        # Table
-        st.subheader("Scenario table")
-        rc_display = rc.copy()
-        rc_display["Portfolio P&L ($M)"] = rc_display["Portfolio P&L ($)"] / 1e6
-        rc_display = rc_display[["SPX Move", "Portfolio P&L ($)", "Portfolio P&L ($M)"]]
-        st.dataframe(
-            rc_display, hide_index=True, use_container_width=True,
-            column_config={
-                "Portfolio P&L ($)": st.column_config.NumberColumn(format="$%.0f"),
-                "Portfolio P&L ($M)": st.column_config.NumberColumn(format="$%.2fM"),
-            }
+        st.markdown("---")
+        
+        # ========== SECTION 3: P&L payoff chart with granularity ==========
+        st.subheader("P&L Payoff under SPX shock")
+        
+        granularity_b = st.selectbox(
+            "Granularity",
+            ["Total Portfolio", "By Beta Direction (Long / Short Beta)", "By Instrument"],
+            key="granularity_pnl",
         )
+        
+        fig3 = go.Figure()
+        
+        if granularity_b == "Total Portfolio":
+            fig3.add_trace(go.Scatter(
+                x=spx_x, y=rc["pnl_by_direction"]["Total"]/1e6,
+                mode="lines+markers", name="Portfolio P&L",
+                line=dict(color="#0A1931", width=3),
+                marker=dict(size=8, color="#D4A017"),
+                fill="tozeroy", fillcolor="rgba(10,25,49,0.1)",
+            ))
+        elif granularity_b == "By Beta Direction (Long / Short Beta)":
+            fig3.add_trace(go.Scatter(
+                x=spx_x, y=rc["pnl_by_direction"]["Long Beta"]/1e6,
+                mode="lines+markers", name="Long Beta (short SQQQ/SOXS)",
+                line=dict(color="#2E8B57", width=3),
+                marker=dict(size=7),
+            ))
+            fig3.add_trace(go.Scatter(
+                x=spx_x, y=rc["pnl_by_direction"]["Short Beta"]/1e6,
+                mode="lines+markers", name="Short Beta (QQQ/SOXX puts)",
+                line=dict(color="#B22222", width=3),
+                marker=dict(size=7),
+            ))
+            fig3.add_trace(go.Scatter(
+                x=spx_x, y=rc["pnl_by_direction"]["Total"]/1e6,
+                mode="lines+markers", name="Net Portfolio",
+                line=dict(color="#0A1931", width=2, dash="dash"),
+                marker=dict(size=6),
+            ))
+        else:
+            palette = px.colors.qualitative.Set1 + px.colors.qualitative.Set2
+            for i, col in enumerate(rc["pnl_by_position"].columns):
+                if col == "Total":
+                    continue
+                fig3.add_trace(go.Scatter(
+                    x=spx_x, y=rc["pnl_by_position"][col]/1e6,
+                    mode="lines+markers", name=col,
+                    line=dict(color=palette[i % len(palette)], width=2),
+                    marker=dict(size=5),
+                ))
+            fig3.add_trace(go.Scatter(
+                x=spx_x, y=rc["pnl_by_position"]["Total"]/1e6,
+                mode="lines+markers", name="Total",
+                line=dict(color="#0A1931", width=3, dash="dash"),
+                marker=dict(size=6),
+            ))
+        
+        fig3.add_hline(y=0, line_dash="dot", line_color="#AAA")
+        fig3.add_vline(x=0, line_dash="dot", line_color="#AAA")
+        fig3.update_layout(
+            xaxis_title="SPX Move (%)",
+            yaxis_title="P&L ($M)",
+            height=450,
+            hovermode="x unified",
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        fig3.update_xaxes(ticksuffix="%", gridcolor="#EEE")
+        fig3.update_yaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
+        st.plotly_chart(fig3, use_container_width=True)
+        
+        st.markdown("---")
+        st.subheader("Scenario summary table")
+        disp = summary_df.copy()
+        disp["Portfolio P&L"] = disp["Portfolio P&L"].apply(fmt_money)
+        disp["Gross Delta Exposure"] = disp["Gross Delta Exposure"].apply(fmt_money)
+        disp["Net Delta Exposure"] = disp["Net Delta Exposure"].apply(fmt_money)
+        disp["Net Beta-Adj Exposure"] = disp["Net Beta-Adj Exposure"].apply(fmt_money)
+        disp = disp.drop(columns=["SPX Move (decimal)"])
+        st.dataframe(disp, hide_index=True, use_container_width=True)
 
 # =========================================================================
 # PAGE: EXPECTED RETURN
 # =========================================================================
 elif page == "💰 Expected Return":
-    st.title("Expected Return — Vol Decay on LAI ETF Options")
+    st.title("Expected Return — Vol Decay & Protection Cost")
     st.caption(
         f"Assumes: underlying 1Y return = {r_1y_assumption*100:.1f}%, "
         "underlying vol = 260-day realized, constant implied vol. "
-        "Expected return = intrinsic value at expiry (from decayed spot) vs today's mid price."
+        "LAI options: expected fair value at expiry via decay, annualized CAGR. "
+        "Cash shorts: 1-year expected LAI decay × notional. "
+        "Protection: long non-LAI puts — premium / years-to-expiry."
     )
     
     enriched = get_enriched_positions()
@@ -462,50 +603,94 @@ elif page == "💰 Expected Return":
         with st.spinner("Computing expected returns..."):
             result = expected_return_table(enriched, r_1y_assumption)
         
-        table = result["table"]
-        
-        if len(table) == 0:
-            st.warning("No LAI ETF options in portfolio. Expected return is based on LAI options only.")
-        else:
-            # Portfolio metrics
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                st.metric("Weighted LAI Return (ann.)",
-                          fmt_pct(result["weighted_lai_return"]))
-            with c2:
-                st.metric("Total LAI Premium", fmt_money(result["total_lai_mv"]))
-            with c3:
-                st.metric("Protection Cost (ann.)",
-                          fmt_money(result["total_protection_cost_annual"]))
-                st.caption(f"{fmt_pct(result['protection_cost_pct_of_lai'])} of LAI premium")
-            with c4:
-                net = result["net_expected_return"]
-                color = "gain" if (net is not None and not np.isnan(net) and net >= 0) else "loss"
-                st.metric("Net Expected Return (ann.)", fmt_pct(net))
-            
-            st.markdown("---")
-            st.subheader(f"LAI option detail ({result['n_lai_options']} positions)")
-            
-            # Format display
-            disp = table.copy()
-            disp["Underlying Vol"] = disp["Underlying Vol"].apply(lambda x: f"{x*100:.1f}%")
-            disp["Expected Decay"] = disp["Expected Decay"].apply(lambda x: f"{x*100:.1f}%")
-            disp["Exp. Total Return"] = disp["Exp. Total Return"].apply(lambda x: f"{x*100:.1f}%")
-            disp["Exp. Annual Return"] = disp["Exp. Annual Return"].apply(lambda x: f"{x*100:.1f}%")
-            disp["Years"] = disp["Years"].apply(lambda x: f"{x:.2f}")
-            disp["Exp. Spot @ Expiry"] = disp["Exp. Spot @ Expiry"].apply(lambda x: f"${x:.2f}")
-            disp["Intrinsic @ Expiry"] = disp["Intrinsic @ Expiry"].apply(lambda x: f"${x:.2f}")
-            disp["Current Mid"] = disp["Current Mid"].apply(lambda x: f"${x:.2f}" if x else "—")
-            
-            st.dataframe(disp, hide_index=True, use_container_width=True)
-            
-            st.info(
-                f"**Methodology:** Vol decay formula = `(1 + r)^L × exp((L − L²) × σ² × T / 2) − 1`. "
-                f"For each LAI option, expected fair value at expiry = `max(K − expected_spot, 0)`. "
-                f"Annualized return = `(FV / mid)^(1/T) − 1`. "
-                f"Protection cost is long non-LAI puts (e.g. QQQ, SOXX puts), annualized as "
-                f"`premium_paid / years_to_expiry`."
+        st.subheader("Expected Annual $ P&L by Leg")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric(
+                "LAI Options (Annual)",
+                fmt_money(result["total_lai_option_annual_usd"]),
             )
+            st.caption(f"{result['n_lai_options']} positions")
+        with c2:
+            st.metric(
+                "Cash Shorts Vol Decay (Annual)",
+                fmt_money(result["total_cash_short_annual_usd"]),
+            )
+            st.caption(f"{result['n_cash_shorts']} positions")
+        with c3:
+            st.metric(
+                "Protection Cost (Annual)",
+                fmt_money(-result["total_protection_annual_cost_usd"]),
+            )
+            st.caption(f"{result['n_protection_options']} positions")
+        with c4:
+            st.metric(
+                "Net Annual P&L",
+                fmt_money(result["net_annual_pnl_usd"]),
+            )
+        
+        st.markdown("---")
+        
+        st.subheader("Return on Gross Deployed")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Total Gross Exposure", fmt_money(result["total_gross_exposure"]))
+        with c2:
+            st.metric("Net Annual P&L", fmt_money(result["net_annual_pnl_usd"]))
+        with c3:
+            ret = result["return_on_gross"]
+            st.metric(
+                "Annual Return on Gross",
+                fmt_pct(ret) if ret is not None and not np.isnan(ret) else "—",
+            )
+        
+        st.markdown("---")
+        
+        if len(result["lai_option_table"]) > 0:
+            st.subheader(f"LAI Options ({result['n_lai_options']})")
+            t = result["lai_option_table"].copy()
+            t["Underlying Vol"] = t["Underlying Vol"].apply(fmt_pct)
+            t["Expected Decay"] = t["Expected Decay"].apply(fmt_pct)
+            t["Exp. Total Return"] = t["Exp. Total Return"].apply(fmt_pct)
+            t["Exp. Annual Return"] = t["Exp. Annual Return"].apply(fmt_pct)
+            t["Years"] = t["Years"].apply(lambda x: f"{x:.2f}")
+            t["Exp. Spot @ Expiry"] = t["Exp. Spot @ Expiry"].apply(lambda x: fmt_money(x, show_cents=True))
+            t["Intrinsic @ Expiry"] = t["Intrinsic @ Expiry"].apply(lambda x: fmt_money(x, show_cents=True))
+            t["Current Mid"] = t["Current Mid"].apply(lambda x: fmt_money(x, show_cents=True) if x else "—")
+            t["Strike"] = t["Strike"].apply(lambda x: fmt_money(x, show_cents=True))
+            t["Qty"] = t["Qty"].apply(fmt_int)
+            t["Market Value ($)"] = t["Market Value ($)"].apply(fmt_money)
+            t["Annual P&L ($)"] = t["Annual P&L ($)"].apply(fmt_money)
+            st.dataframe(t, hide_index=True, use_container_width=True)
+        
+        if len(result["cash_short_table"]) > 0:
+            st.subheader(f"Cash Positions — 1Y Vol Decay ({result['n_cash_shorts']})")
+            t = result["cash_short_table"].copy()
+            t["Underlying Vol"] = t["Underlying Vol"].apply(fmt_pct)
+            t["1Y Expected Decay"] = t["1Y Expected Decay"].apply(fmt_pct)
+            t["Spot"] = t["Spot"].apply(lambda x: fmt_money(x, show_cents=True) if x else "—")
+            t["Qty"] = t["Qty"].apply(fmt_int)
+            t["Notional ($)"] = t["Notional ($)"].apply(fmt_money)
+            t["Annual P&L ($)"] = t["Annual P&L ($)"].apply(fmt_money)
+            st.dataframe(t, hide_index=True, use_container_width=True)
+        
+        if len(result["protection_table"]) > 0:
+            st.subheader(f"Protection (Long Non-LAI Puts) — {result['n_protection_options']}")
+            t = result["protection_table"].copy()
+            t["Strike"] = t["Strike"].apply(lambda x: fmt_money(x, show_cents=True))
+            t["Current Mid"] = t["Current Mid"].apply(lambda x: fmt_money(x, show_cents=True))
+            t["Qty"] = t["Qty"].apply(fmt_int)
+            t["Years to Expiry"] = t["Years to Expiry"].apply(lambda x: f"{x:.2f}")
+            t["Total Premium ($)"] = t["Total Premium ($)"].apply(fmt_money)
+            t["Annual Cost ($)"] = t["Annual Cost ($)"].apply(fmt_money)
+            st.dataframe(t, hide_index=True, use_container_width=True)
+        
+        st.info(
+            "**Methodology:** Vol decay formula = `(1 + r_1y)^L × exp((L − L²) × σ² × T / 2) − 1`. "
+            "LAI options: fair value at expiry = `max(K − expected_spot, 0)`. "
+            "Cash shorts: `annual_pnl = -decay_1y × notional` for short positions. "
+            "Protection cost: `premium / years_to_expiry`."
+        )
 
 # =========================================================================
 # PAGE: STRESS SCENARIO
@@ -513,68 +698,72 @@ elif page == "💰 Expected Return":
 elif page == "⚠️ Stress Scenario":
     st.title("Stress Scenario Analysis")
     
-    # Scenario controls
     st.subheader("Stress scenario parameters")
     st.caption(
-        "Default scenario models observed 'extreme' LAI rallies with stressed leverage multipliers "
-        "(-4x SQQQ observed 2022, -6x SOXS observed April 2025)."
+        "Default scenario: observed 'extreme' LAI rallies with stressed leverage multipliers "
+        "(SQQQ +132.1% at -4x, Dec 2021-Jun 2022; SOXS +229% at -6x, Jan-Apr 2025)."
     )
     
     # Historical reference panels
-    st.markdown("#### Historical reference periods")
+    st.markdown("#### Historical reference periods (intraday trough-to-high)")
     rc1, rc2 = st.columns(2)
     with rc1:
-        sc_soxs = STRESS_SCENARIOS["SOXS (22 Jan 2025 – 7 Apr 2025)"]
         with st.container(border=True):
             st.markdown("**SOXS Stress (22 Jan 2025 → 7 Apr 2025)**")
-            # Fetch OHLC moves for reference
             try:
                 import yfinance as yf
-                soxs_hist = yf.Ticker("SOXS").history(start=sc_soxs["start"], end="2025-04-08", auto_adjust=False)
-                soxx_hist = yf.Ticker("SOXX").history(start=sc_soxs["start"], end="2025-04-08", auto_adjust=False)
+                soxs_hist = yf.Ticker("SOXS").history(start="2025-01-22", end="2025-04-08", auto_adjust=False)
+                soxx_hist = yf.Ticker("SOXX").history(start="2025-01-22", end="2025-04-08", auto_adjust=False)
                 if len(soxs_hist) > 0 and len(soxx_hist) > 0:
-                    soxs_pct = soxs_hist["Close"].iloc[-1] / soxs_hist["Open"].iloc[0] - 1
-                    soxx_pct = soxx_hist["Close"].iloc[-1] / soxx_hist["Open"].iloc[0] - 1
-                    st.write(f"SOXX: {soxx_pct*100:+.1f}%")
-                    st.write(f"SOXS: {soxs_pct*100:+.1f}%")
-                    st.caption(f"Implied leverage: {soxs_pct/soxx_pct:.2f}x")
+                    soxs_low = soxs_hist["Low"].min()
+                    soxs_high = soxs_hist["High"].max()
+                    soxx_low = soxx_hist["Low"].min()
+                    soxx_high = soxx_hist["High"].max()
+                    soxs_intraday = soxs_high/soxs_low - 1
+                    soxx_intraday = soxx_low/soxx_high - 1
+                    st.write(f"SOXX intraday high→low: {fmt_pct(soxx_intraday, 1)}")
+                    st.write(f"SOXS intraday low→high: {fmt_pct(soxs_intraday, 1)}")
+                    if soxx_intraday != 0:
+                        st.caption(f"Implied stressed leverage: {soxs_intraday/soxx_intraday:.2f}x")
             except Exception:
-                st.write("SOXS: +~200% (reference)")
-                st.write("SOXX: -~33% (reference)")
+                st.write("SOXS: +~229% (reference)")
+                st.write("SOXX: -~38% (reference)")
     
     with rc2:
-        sc_sqqq = STRESS_SCENARIOS["SQQQ (27 Dec 2021 – 16 Jun 2022)"]
         with st.container(border=True):
             st.markdown("**SQQQ Stress (27 Dec 2021 → 16 Jun 2022)**")
             try:
                 import yfinance as yf
-                sqqq_hist = yf.Ticker("SQQQ").history(start=sc_sqqq["start"], end="2022-06-17", auto_adjust=False)
-                qqq_hist = yf.Ticker("QQQ").history(start=sc_sqqq["start"], end="2022-06-17", auto_adjust=False)
+                sqqq_hist = yf.Ticker("SQQQ").history(start="2021-12-27", end="2022-06-17", auto_adjust=False)
+                qqq_hist = yf.Ticker("QQQ").history(start="2021-12-27", end="2022-06-17", auto_adjust=False)
                 if len(sqqq_hist) > 0 and len(qqq_hist) > 0:
-                    sqqq_pct = sqqq_hist["Close"].iloc[-1] / sqqq_hist["Open"].iloc[0] - 1
-                    qqq_pct = qqq_hist["Close"].iloc[-1] / qqq_hist["Open"].iloc[0] - 1
-                    st.write(f"QQQ: {qqq_pct*100:+.1f}%")
-                    st.write(f"SQQQ: {sqqq_pct*100:+.1f}%")
-                    st.caption(f"Implied leverage: {sqqq_pct/qqq_pct:.2f}x")
+                    sqqq_low = sqqq_hist["Low"].min()
+                    sqqq_high = sqqq_hist["High"].max()
+                    qqq_low = qqq_hist["Low"].min()
+                    qqq_high = qqq_hist["High"].max()
+                    sqqq_intraday = sqqq_high/sqqq_low - 1
+                    qqq_intraday = qqq_low/qqq_high - 1
+                    st.write(f"QQQ intraday high→low: {fmt_pct(qqq_intraday, 1)}")
+                    st.write(f"SQQQ intraday low→high: {fmt_pct(sqqq_intraday, 1)}")
+                    if qqq_intraday != 0:
+                        st.caption(f"Implied stressed leverage: {sqqq_intraday/qqq_intraday:.2f}x")
             except Exception:
-                st.write("SQQQ: +~130% (reference)")
-                st.write("QQQ: -~32.5% (reference)")
+                st.write("SQQQ: +~132% (reference)")
+                st.write("QQQ: -~33% (reference)")
     
     st.markdown("---")
     
-    # User-adjustable inputs
     st.markdown("#### Stress parameters (editable)")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        sqqq_pct = st.number_input("SQQQ move (%)", value=130.0, step=5.0) / 100
+        sqqq_pct = st.number_input("SQQQ move (%)", value=132.1, step=5.0) / 100
     with c2:
         sqqq_lev = st.number_input("SQQQ stressed leverage", value=-4.0, step=0.5)
     with c3:
-        soxs_pct = st.number_input("SOXS move (%)", value=200.0, step=5.0) / 100
+        soxs_pct = st.number_input("SOXS move (%)", value=229.0, step=5.0) / 100
     with c4:
         soxs_lev = st.number_input("SOXS stressed leverage", value=-6.0, step=0.5)
     
-    # Run stress
     enriched = get_enriched_positions()
     if len([p for p in enriched if p["status"] == "OPEN"]) == 0:
         st.info("No open positions.")
@@ -588,7 +777,6 @@ elif page == "⚠️ Stress Scenario":
                 soxs_leverage=int(soxs_lev),
             )
         
-        # Headline metrics
         st.subheader("Stress impact")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
@@ -602,17 +790,21 @@ elif page == "⚠️ Stress Scenario":
                      if stress["current_gross_exposure"] > 0 else 0)
             st.metric("Gross Multiplier", f"{ratio:.2f}x")
         
-        # Implied moves
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Stressed Gross Delta-Adj Exposure", fmt_money(stress["stressed_delta_adj_gross"]))
+        with c2:
+            st.metric("Stressed Net Delta-Adj Exposure", fmt_money(stress["stressed_delta_adj_net"]))
+        
         st.caption(
-            f"**Implied moves:** QQQ = {stress['qqq_implied']*100:+.1f}%, "
-            f"SOXX = {stress['soxx_implied']*100:+.1f}% "
-            f"(derived from SQQQ {sqqq_pct*100:+.0f}% at {int(sqqq_lev)}x and "
-            f"SOXS {soxs_pct*100:+.0f}% at {int(soxs_lev)}x)"
+            f"**Implied moves:** QQQ = {fmt_pct(stress['qqq_implied'], 1)}, "
+            f"SOXX = {fmt_pct(stress['soxx_implied'], 1)} "
+            f"(derived from SQQQ {fmt_pct(sqqq_pct, 1)} at {int(sqqq_lev)}x and "
+            f"SOXS {fmt_pct(soxs_pct, 1)} at {int(soxs_lev)}x)"
         )
         
         st.markdown("---")
         
-        # Steady-state solver
         st.subheader("Steady-state gross deployment")
         ss = steady_state_gross(enriched, stress, gross_limit=gross_limit)
         
@@ -621,7 +813,7 @@ elif page == "⚠️ Stress Scenario":
             st.metric("Gross Limit", fmt_money(ss["gross_limit"]))
         with sc2:
             st.metric(
-                "Stress Gross / Current Gross Ratio",
+                "Stress Gross / Current Ratio",
                 f"{ss['stress_gross_ratio']:.2f}x"
             )
         with sc3:
@@ -630,26 +822,30 @@ elif page == "⚠️ Stress Scenario":
         st.info(
             f"If you scale your current positions by {ss['scaling_factor']:.2f}x, "
             f"your stressed gross exposure would equal the {fmt_money(ss['gross_limit'])} limit. "
-            f"In other words, steady-state gross should not exceed {fmt_money(ss['steady_state_gross'])} "
+            f"Steady-state gross should not exceed {fmt_money(ss['steady_state_gross'])} "
             f"to survive this stress scenario without breaching the gross limit."
         )
         
         st.markdown("---")
         
-        # By-position detail
         st.subheader("By-position detail under stress")
         by_pos = stress["by_position"]
         if len(by_pos) > 0:
             disp = by_pos.copy()
-            disp["Move %"] = (disp["Move %"] * 100).round(1).astype(str) + "%"
-            for col in ["Current Spot", "Stressed Spot", "Stressed Price"]:
-                disp[col] = disp[col].apply(lambda x: f"${x:.2f}")
-            for col in ["Current MV", "Stressed MV", "Stressed Gross", "Stress P&L"]:
-                disp[col] = disp[col].apply(fmt_money)
+            disp["Move %"] = disp["Move %"].apply(fmt_pct)
+            disp["Current Spot"] = disp["Current Spot"].apply(lambda x: fmt_money(x, show_cents=True))
+            disp["Stressed Spot"] = disp["Stressed Spot"].apply(lambda x: fmt_money(x, show_cents=True))
+            disp["Stressed Price"] = disp["Stressed Price"].apply(lambda x: fmt_money(x, show_cents=True))
+            disp["Stressed Delta"] = disp["Stressed Delta"].apply(lambda x: f"{x:.3f}")
+            disp["Current MV"] = disp["Current MV"].apply(fmt_money)
+            disp["Stressed MV"] = disp["Stressed MV"].apply(fmt_money)
+            disp["Stressed Gross"] = disp["Stressed Gross"].apply(fmt_money)
+            disp["Stressed Delta-Adj Exposure"] = disp["Stressed Delta-Adj Exposure"].apply(fmt_money)
+            disp["Stress P&L"] = disp["Stress P&L"].apply(fmt_money)
             st.dataframe(disp, hide_index=True, use_container_width=True)
 
 # =========================================================================
-# PAGE: SETTINGS / DATA REFRESH
+# PAGE: SETTINGS
 # =========================================================================
 elif page == "⚙️ Settings / Data Refresh":
     st.title("Settings & Data")
@@ -678,27 +874,25 @@ elif page == "⚙️ Settings / Data Refresh":
         col1, col2, col3 = st.columns(3)
         with col1:
             spot = get_spot(ticker_test)
-            st.metric("Spot", f"${spot:.2f}" if spot else "N/A")
+            st.metric("Spot", fmt_money(spot, show_cents=True) if spot else "N/A")
         with col2:
-            # Beta of the underlying if LAI, else direct
             lai = get_lai_info(ticker_test)
             if lai:
                 beta = compute_beta(lai["underlying"])
-                st.metric(f"β ({lai['underlying']} vs SPY)",
+                st.metric(f"Beta ({lai['underlying']} vs SPY)",
                           f"{beta:.3f}" if not np.isnan(beta) else "N/A")
-                st.caption(f"Effective β of {ticker_test}: {beta * lai['leverage']:.2f}")
+                st.caption(f"Effective beta of {ticker_test}: {beta * lai['leverage']:.2f}")
             else:
                 beta = compute_beta(ticker_test)
-                st.metric(f"β vs SPY", f"{beta:.3f}" if not np.isnan(beta) else "N/A")
+                st.metric(f"Beta vs SPY", f"{beta:.3f}" if not np.isnan(beta) else "N/A")
         with col3:
-            # Vol of the underlying if LAI
             if lai:
                 vol = realized_vol(lai["underlying"], 260)
-                st.metric(f"σ ({lai['underlying']}, 260d)",
-                          f"{vol*100:.1f}%" if not np.isnan(vol) else "N/A")
+                st.metric(f"Vol ({lai['underlying']}, 260d)",
+                          fmt_pct(vol, 1) if not np.isnan(vol) else "N/A")
             else:
                 vol = realized_vol(ticker_test, 260)
-                st.metric(f"σ (260d)", f"{vol*100:.1f}%" if not np.isnan(vol) else "N/A")
+                st.metric(f"Vol (260d)", fmt_pct(vol, 1) if not np.isnan(vol) else "N/A")
     
     st.markdown("---")
     
