@@ -32,7 +32,7 @@ st.set_page_config(
 init_db()
 
 # -------------------------------------------------------------------------
-BUILD_VERSION = "2026-04-20-r6"
+BUILD_VERSION = "2026-04-20-r7"
 
 st.markdown(f"""
 <style>
@@ -121,7 +121,7 @@ r_1y_assumption = 0.0
 st.sidebar.caption(f"""
 Data source: Yahoo Finance (15-min delayed)  
 Risk-free: 4.0% | Div yield: 0.5%  
-Vol decay underlying return: 0.0% (fixed)  
+MC uses historical bootstrap (inherits historical drift)  
 **Build:** {BUILD_VERSION}
 """)
 
@@ -848,15 +848,24 @@ elif page == "💰 Expected Return":
         if len(result["protection_table"]) > 0:
             st.subheader(f"Protection Puts — Monthly Roll ({result['n_protection_options']})")
             t = result["protection_table"].copy()
-            t["Existing Strike"] = t["Existing Strike"].apply(lambda x: fmt_money(x, show_cents=True))
-            t["Spot"] = t["Spot"].apply(lambda x: fmt_money(x, show_cents=True))
-            t["Moneyness"] = t["Moneyness"].apply(lambda x: f"{x*100:.1f}%")
-            t["IV Used"] = t["IV Used"].apply(lambda x: fmt_pct(x, 1))
-            t["Fresh 3M Price"] = t["Fresh 3M Price"].apply(lambda x: fmt_money(x, show_cents=True))
-            t["Aged 2M Price"] = t["Aged 2M Price"].apply(lambda x: fmt_money(x, show_cents=True))
-            t["Qty"] = t["Qty"].apply(fmt_int)
-            t["Per-Roll Cost ($)"] = t["Per-Roll Cost ($)"].apply(fmt_money)
-            t["Annual Cost ($)"] = t["Annual Cost ($)"].apply(fmt_money)
+            # Apply formatting only to columns that exist (defensive against version mismatches)
+            def safe_fmt(col, formatter):
+                if col in t.columns:
+                    t[col] = t[col].apply(formatter)
+            
+            safe_fmt("Existing Strike", lambda x: fmt_money(x, show_cents=True))
+            safe_fmt("Strike", lambda x: fmt_money(x, show_cents=True))  # old schema fallback
+            safe_fmt("Spot", lambda x: fmt_money(x, show_cents=True))
+            safe_fmt("Moneyness", lambda x: f"{x*100:.1f}%")
+            safe_fmt("IV Used", lambda x: fmt_pct(x, 1))
+            safe_fmt("Fresh 3M Price", lambda x: fmt_money(x, show_cents=True))
+            safe_fmt("Aged 2M Price", lambda x: fmt_money(x, show_cents=True))
+            safe_fmt("Buy Price", lambda x: fmt_money(x, show_cents=True))  # old schema fallback
+            safe_fmt("Sell Price (after roll)", lambda x: fmt_money(x, show_cents=True))  # old schema fallback
+            safe_fmt("Current Mid", lambda x: fmt_money(x, show_cents=True))  # old schema fallback
+            safe_fmt("Qty", fmt_int)
+            safe_fmt("Per-Roll Cost ($)", fmt_money)
+            safe_fmt("Annual Cost ($)", fmt_money)
             st.dataframe(t, hide_index=True, use_container_width=True)
             st.caption(
                 "Monthly roll model: buy fresh 3M put at current spot × moneyness strike; "
@@ -920,19 +929,132 @@ elif page == "💰 Expected Return":
             st.dataframe(spot_display_df, hide_index=True, use_container_width=True)
         
         st.markdown("---")
+        
+        # ===== STRATEGY TOTAL P&L DISTRIBUTION (across percentiles) =====
+        st.subheader("Strategy Total P&L — Distribution by Percentile")
+        st.caption(
+            "Combined MC distribution across all cash short positions (summed path-by-path), "
+            "then offset by annual LAI option P&L and protection cost. "
+            "Shows the full shape of expected 1-year strategy outcomes."
+        )
+        
+        # Sum the MC P&L arrays across all cash short positions to get portfolio short P&L per path
+        cash_short_mc_arrays = [
+            row["_mc_all_pnl"] for _, row in result["cash_short_table"].iterrows()
+            if row.get("_mc_all_pnl") is not None
+        ]
+        if len(cash_short_mc_arrays) > 0:
+            # Stack and sum per-path (assumes same n_paths across all positions)
+            try:
+                import numpy as _np
+                stacked = _np.vstack(cash_short_mc_arrays)
+                total_short_pnl_per_path = stacked.sum(axis=0)
+                
+                # Add the deterministic legs (LAI options + protection cost)
+                opt_and_cost_offset = (
+                    result["total_lai_option_annual_usd"]
+                    - result["total_protection_annual_cost_usd"]
+                )
+                strategy_pnl_per_path = total_short_pnl_per_path + opt_and_cost_offset
+                
+                # Compute percentiles 0, 10, 20, ..., 90, 100
+                pct_levels = list(range(0, 101, 10))
+                pct_values = [float(_np.percentile(strategy_pnl_per_path, p)) for p in pct_levels]
+                
+                # Percentile bar chart
+                fig_pct = go.Figure()
+                colors = [
+                    "#8B0000" if v < 0 else "#2E8B57"  # red below zero, green above
+                    for v in pct_values
+                ]
+                fig_pct.add_trace(go.Bar(
+                    x=[f"{p}th" for p in pct_levels],
+                    y=[v / 1e6 for v in pct_values],
+                    marker_color=colors,
+                    text=[f"${v/1e6:,.1f}M" if v >= 0 else f"-${abs(v)/1e6:,.1f}M" for v in pct_values],
+                    textposition="outside",
+                    hovertemplate="%{x} percentile: $%{y:.2f}M<extra></extra>",
+                ))
+                fig_pct.add_hline(y=0, line_dash="dash", line_color="#888")
+                fig_pct.update_layout(
+                    xaxis_title="Percentile of Strategy P&L Distribution",
+                    yaxis_title="Annual Strategy P&L ($M)",
+                    height=450,
+                    plot_bgcolor="white",
+                    paper_bgcolor="white",
+                    showlegend=False,
+                    margin=dict(t=30),
+                )
+                fig_pct.update_yaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
+                st.plotly_chart(fig_pct, use_container_width=True)
+                
+                # Summary table
+                pct_table = pd.DataFrame({
+                    "Percentile": [f"{p}th" for p in pct_levels],
+                    "Strategy P&L ($)": [fmt_money(v) for v in pct_values],
+                    "Strategy P&L ($M)": [f"${v/1e6:+,.2f}M" for v in pct_values],
+                    "% of Gross": [
+                        fmt_pct(v / result["total_gross_exposure"], 1)
+                        if result["total_gross_exposure"] > 0 else "—"
+                        for v in pct_values
+                    ],
+                })
+                st.dataframe(pct_table, hide_index=True, use_container_width=True)
+                
+                st.caption(
+                    f"Strategy = [$\\Sigma$ LAI short MC paths] + [LAI option expected P&L] − [protection roll cost]. "
+                    f"Median (50th pct) strategy P&L: **{fmt_money(_np.median(strategy_pnl_per_path))}**. "
+                    f"Strategy wins in {(strategy_pnl_per_path > 0).mean()*100:.1f}% of paths."
+                )
+                
+                # Full distribution histogram  
+                st.markdown("**Full P&L distribution across all MC paths**")
+                fig_dist = go.Figure()
+                pnl_m = strategy_pnl_per_path / 1e6
+                fig_dist.add_trace(go.Histogram(
+                    x=pnl_m,
+                    nbinsx=80,
+                    marker_color="#0A1931",
+                    opacity=0.8,
+                    hovertemplate="P&L: $%{x:.1f}M<br>Paths: %{y}<extra></extra>",
+                ))
+                median_m = float(_np.median(pnl_m))
+                mean_m = float(_np.mean(pnl_m))
+                fig_dist.add_vline(x=median_m, line_dash="solid", line_color="#2E8B57", line_width=3,
+                                    annotation_text=f"Median ${median_m:,.1f}M",
+                                    annotation_position="top")
+                fig_dist.add_vline(x=mean_m, line_dash="solid", line_color="#D4A017", line_width=3,
+                                    annotation_text=f"Mean ${mean_m:,.1f}M",
+                                    annotation_position="top right")
+                fig_dist.add_vline(x=0, line_dash="dot", line_color="#B22222", line_width=2)
+                fig_dist.update_layout(
+                    xaxis_title="Annual Strategy P&L ($M)",
+                    yaxis_title="# of Paths",
+                    height=380,
+                    plot_bgcolor="white",
+                    paper_bgcolor="white",
+                    showlegend=False,
+                    bargap=0.02,
+                )
+                fig_dist.update_xaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
+                fig_dist.update_yaxes(gridcolor="#EEE")
+                st.plotly_chart(fig_dist, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Could not compute strategy distribution: {e}")
+        
+        st.markdown("---")
         st.info(
             "**Methodology notes:**\n\n"
-            "1. **Simple vol decay formula** (reference): `(1 + r)^L × exp((L − L²) × σ² × T / 2) − 1` — gives "
-            "expected log decay of the LAI ETF. Applied to short $ notional gives the naive expected P&L.\n\n"
-            "2. **Monte Carlo compounded short**: simulates the underlying as GBM, mechanically applies "
-            "tracking leverage to get LAI daily returns, and applies the daily top-up rule "
-            "(if short MV < target, top up to target; otherwise ride). Captures path dependence. "
-            "Mean P&L is typically much lower than the simple formula due to right-tail risk.\n\n"
-            "3. **Protection roll cost**: 3M 95% put bought, 1 month later sold as a 2M 95% put "
+            "1. **Simple vol decay formula** (reference only): `(1 + r)^L × exp((L − L²) × σ² × T / 2) − 1` — "
+            "closed-form idealized expected decay of the LAI price. Does NOT capture path dependence or historical drift.\n\n"
+            "2. **Monte Carlo compounded short (PRIMARY METHOD)**: uses **historical block bootstrap** of actual "
+            "underlying (QQQ, SOXX) daily returns in 5-day blocks. Preserves volatility clustering, historical drift "
+            "(e.g. +20% QQQ / +29% SOXX annualized over 2020-2026), momentum, mean reversion. Applies tracking leverage "
+            "to generate LAI daily returns, then daily top-up rule. Median P&L is the primary metric.\n\n"
+            "3. **Protection roll cost**: 3M fresh put bought at current moneyness × spot; 1 month later sold as a 2M put "
             "(assuming spot unchanged). Per-roll cost = buy − sell. Annualized cost = per-roll × 12.\n\n"
-            "4. **Tracking leverage** defaults to -3x but is adjustable. In Covid 2020 and April 2025 "
-            "Liberation Day, realized tracking was closer to -6x for SOXS (reflects the leveraged ETF's "
-            "mechanical behavior during extreme single-direction moves)."
+            "4. **Tracking leverage** defaults to -3x but is adjustable. In Covid 2020 and April 2025 Liberation Day, "
+            "realized tracking for SOXS was closer to -6x. Stress modes -4/-5/-6x available."
         )
 
 # =========================================================================
