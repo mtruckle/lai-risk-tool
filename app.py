@@ -32,7 +32,7 @@ st.set_page_config(
 init_db()
 
 # -------------------------------------------------------------------------
-BUILD_VERSION = "2026-04-20-r8"
+BUILD_VERSION = "2026-04-23-r9"
 
 st.markdown(f"""
 <style>
