@@ -384,11 +384,29 @@ def risk_curve(enriched_positions: list, asof_date=None) -> dict:
     # Label rows for readability
     labels = [f"{m*100:+.1f}%" for m in spx_moves]
     
-    # Position keys (for column names)
-    pos_keys = [p["bbg_ticker"] for p in open_pos]
+    # Build unique per-row display keys. If two open rows share the same bbg_ticker
+    # (e.g. separate tranches of the same contract entered on different dates), we
+    # disambiguate ONLY the duplicates with "#<id>" so the common case still shows
+    # clean ticker strings in the UI. Each open position row gets exactly one key.
+    ticker_counts = {}
+    for p in open_pos:
+        t = p["bbg_ticker"]
+        ticker_counts[t] = ticker_counts.get(t, 0) + 1
     
-    # Classify positions by beta direction
-    direction_map = {p["bbg_ticker"]: _classify_beta_direction(p) for p in open_pos}
+    pos_keys = []
+    key_by_rowidx = {}  # row index in open_pos -> display key
+    for i, p in enumerate(open_pos):
+        t = p["bbg_ticker"]
+        if ticker_counts[t] > 1:
+            k = f"{t} #{p.get('id', i)}"
+        else:
+            k = t
+        pos_keys.append(k)
+        key_by_rowidx[i] = k
+    
+    # Classify positions by beta direction (keyed by unique display key)
+    direction_map = {key_by_rowidx[i]: _classify_beta_direction(p)
+                     for i, p in enumerate(open_pos)}
     
     # Storage
     pnl_pos = {k: [] for k in pos_keys}
@@ -406,8 +424,8 @@ def risk_curve(enriched_positions: list, asof_date=None) -> dict:
         net_delta_exp = 0
         net_beta_adj_exp = 0
         
-        for p in open_pos:
-            k = p["bbg_ticker"]
+        for i, p in enumerate(open_pos):
+            k = key_by_rowidx[i]
             spot = p.get("spot")
             if not spot:
                 pnl_pos[k].append(0)
@@ -448,6 +466,21 @@ def risk_curve(enriched_positions: list, asof_date=None) -> dict:
         })
     
     summary_df = pd.DataFrame(summary_rows)
+    
+    # Defensive: every per-position series must have len == len(labels). If this
+    # ever fails, surface a clear diagnostic rather than a cryptic pandas error.
+    # (Pre-fix, duplicate tickers caused some series to have 2x length.)
+    expected_len = len(labels)
+    for store_name, store in (("pnl_pos", pnl_pos),
+                              ("delta_exp_pos", delta_exp_pos),
+                              ("beta_adj_exp_pos", beta_adj_exp_pos)):
+        bad = {k: len(v) for k, v in store.items() if len(v) != expected_len}
+        if bad:
+            raise ValueError(
+                f"risk_curve: {store_name} has ragged series (expected length "
+                f"{expected_len}): {bad}. This usually means two open positions "
+                f"produced the same key. Review open positions for duplicate IDs."
+            )
     
     pnl_by_position = pd.DataFrame(pnl_pos, index=labels)
     pnl_by_position["Total"] = pnl_by_position.sum(axis=1)
