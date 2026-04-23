@@ -32,7 +32,7 @@ st.set_page_config(
 init_db()
 
 # -------------------------------------------------------------------------
-BUILD_VERSION = "2026-04-20-r7"
+BUILD_VERSION = "2026-04-20-r8"
 
 st.markdown(f"""
 <style>
@@ -665,397 +665,272 @@ elif page == "📈 Risk Curve":
 # PAGE: EXPECTED RETURN
 # =========================================================================
 elif page == "💰 Expected Return":
-    st.title("Expected Return — Vol Decay & Protection Cost")
+    st.title("Strategy 3 — Compounded Short + Vanilla Put Hedge")
     st.caption(
-        "LAI shorts: compounded daily top-up simulated via Monte Carlo (5,000 paths). "
-        "LAI options: expected fair value at expiry via decay formula, annualized CAGR. "
-        "Protection puts: monthly roll cost × 12 (buy 3M, sell 2M). "
-        "Underlying 1Y return assumption: 0% (isolates vol decay alpha)."
+        "Compounded LAI short with daily top-up, hedged with monthly-rolled 3M vanilla puts on the underlying. "
+        "Historical backtest replays actual 2020-2026 history. Forward MC uses 20-day joint block bootstrap "
+        "of (underlying returns, VIX, VXN) to preserve spot-vol correlation and crash dynamics."
+    )
+
+    from monte_carlo import historical_backtest, forward_mc, load_joint_history
+    
+    # Cache joint history load
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _cached_history():
+        return load_joint_history()
+    
+    try:
+        hist = _cached_history()
+    except Exception as e:
+        st.error(f"Could not load historical data: {e}")
+        st.stop()
+    
+    st.info(
+        f"Historical data loaded: {hist['n_days']} trading days "
+        f"({pd.to_datetime(hist['dates'][0]).strftime('%Y-%m-%d')} to "
+        f"{pd.to_datetime(hist['dates'][-1]).strftime('%Y-%m-%d')}). "
+        "QQQ puts priced at VXN. SOXX puts priced at VIX × 1.33."
     )
     
     # --- Controls ---
-    ctl1, ctl2, ctl3 = st.columns(3)
+    ctl1, ctl2, ctl3, ctl4 = st.columns(4)
     with ctl1:
+        target_notional_m = st.number_input(
+            "Short notional per leg ($M)", 
+            value=15.0, step=1.0, min_value=0.1, max_value=1000.0,
+        )
+        target_notional = target_notional_m * 1e6
+    with ctl2:
         tracking_leverage = st.selectbox(
             "LAI Tracking Leverage",
-            options=[-3.0, -4.0, -5.0, -6.0],
-            index=0,
-            help="-3x is normal. -4/-5/-6 model stress tracking (e.g. SOXS hit -6x in April 2025).",
-        )
-    with ctl2:
-        mc_paths = st.selectbox(
-            "Monte Carlo paths",
-            options=[1000, 3000, 5000, 10000],
-            index=2,
-            help="More paths = more accurate but slower.",
+            options=[-3.0, -4.0, -5.0, -6.0], index=0,
+            help="-3x is normal. Stress -4/-5/-6× for extreme regimes.",
         )
     with ctl3:
-        roll_freq = st.selectbox(
-            "Protection roll frequency (months)",
-            options=[1, 2, 3],
-            index=0,
-        )
+        horizon_years = st.selectbox("Forward MC horizon (years)", options=[1, 3, 5, 10], index=3)
+    with ctl4:
+        n_paths = st.selectbox("Forward MC paths", options=[1000, 3000, 5000, 10000], index=2)
     
-    enriched = get_enriched_positions()
-    if len([p for p in enriched if p["status"] == "OPEN"]) == 0:
-        st.info("No open positions.")
-    else:
-        with st.spinner(f"Running Monte Carlo ({mc_paths:,} paths per short position)..."):
-            result = expected_return_table(
-                enriched,
-                r_1y_assumption=0.0,
-                use_mc=True,
-                mc_paths=mc_paths,
-                tracking_leverage=tracking_leverage,
-                roll_frequency_months=roll_freq,
-                option_tenor_months=3,
+    # Build config: both strike/ratio combos for side-by-side comparison
+    configs = [
+        {"label": "95% @ 3.45×", "strike_pct": 0.95, "ratio": 3.45},
+        {"label": "90% @ 3.9×",  "strike_pct": 0.90, "ratio": 3.9},
+    ]
+    
+    # ========================================================================
+    # SECTION 1: HISTORICAL BACKTEST — reproduces spreadsheet
+    # ========================================================================
+    st.markdown("---")
+    st.header("Historical Backtest — 2020-2026")
+    st.caption(
+        "Deterministic replay of actual historical returns. "
+        "Unhedged version should match the hardcoded Bloomberg spreadsheet. "
+        "Hedged version shows both 95%@3.45× and 90%@3.9× side-by-side for Calmar comparison."
+    )
+    
+    with st.spinner("Running historical backtests..."):
+        # Run unhedged and both hedged configs for both LAI ETFs
+        hist_results = {}
+        for lai, underlying in [('SQQQ', 'QQQ'), ('SOXS', 'SOXX')]:
+            hist_results[f"{lai}_unhedged"] = historical_backtest(
+                underlying=underlying, target_notional=target_notional,
+                tracking_leverage=tracking_leverage, include_puts=False, history=hist,
             )
-        
-        # ===== HEADLINE METRICS =====
-        st.subheader("Expected Annual $ P&L by Leg")
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("LAI Options", fmt_money(result["total_lai_option_annual_usd"]))
-            st.caption(f"{result['n_lai_options']} positions")
-        with c2:
-            st.metric("Cash Shorts (MC median)", fmt_money(result["total_cash_short_annual_usd"]))
-            st.caption(f"{result['n_cash_shorts']} positions · simple formula: {fmt_money(result['total_cash_short_simple_usd'])}")
-        with c3:
-            st.metric("Protection Cost (monthly roll)", fmt_money(-result["total_protection_annual_cost_usd"]))
-            st.caption(f"{result['n_protection_options']} positions · 12 rolls/yr")
-        with c4:
-            st.metric("Net Annual P&L", fmt_money(result["net_annual_pnl_usd"]))
-        
-        st.info(
-            "**Cash shorts use MONTE CARLO MEDIAN** as the primary metric. The mean is distorted "
-            "by a small number of catastrophic tail paths where the LAI rallies 500%+ in a year. "
-            "Median represents the TYPICAL outcome across paths. See the distribution below."
-        )
-        
-        st.markdown("---")
-        
-        st.subheader("Return on Gross Deployed")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Total Gross Exposure", fmt_money(result["total_gross_exposure"]))
-        with c2:
-            st.metric("Net Annual P&L", fmt_money(result["net_annual_pnl_usd"]))
-        with c3:
-            ret = result["return_on_gross"]
-            st.metric("Annual Return on Gross",
-                      fmt_pct(ret) if ret is not None and not np.isnan(ret) else "—")
-        
-        st.markdown("---")
-        
-        # ===== DETAIL TABLES =====
-        if len(result["lai_option_table"]) > 0:
-            st.subheader(f"LAI Options ({result['n_lai_options']})")
-            t = result["lai_option_table"].copy()
-            t["Underlying Vol"] = t["Underlying Vol"].apply(fmt_pct)
-            t["Expected Decay"] = t["Expected Decay"].apply(fmt_pct)
-            t["Exp. Total Return"] = t["Exp. Total Return"].apply(fmt_pct)
-            t["Exp. Annual Return"] = t["Exp. Annual Return"].apply(fmt_pct)
-            t["Years"] = t["Years"].apply(lambda x: f"{x:.2f}")
-            t["Exp. Spot @ Expiry"] = t["Exp. Spot @ Expiry"].apply(lambda x: fmt_money(x, show_cents=True))
-            t["Intrinsic @ Expiry"] = t["Intrinsic @ Expiry"].apply(lambda x: fmt_money(x, show_cents=True))
-            t["Current Mid"] = t["Current Mid"].apply(lambda x: fmt_money(x, show_cents=True) if x else "—")
-            t["Strike"] = t["Strike"].apply(lambda x: fmt_money(x, show_cents=True))
-            t["Qty"] = t["Qty"].apply(fmt_int)
-            t["Market Value ($)"] = t["Market Value ($)"].apply(fmt_money)
-            t["Annual P&L ($)"] = t["Annual P&L ($)"].apply(fmt_money)
-            st.dataframe(t, hide_index=True, use_container_width=True)
-        
-        if len(result["cash_short_table"]) > 0:
-            st.subheader(f"Cash Shorts — Compounded MC vs Simple Formula ({result['n_cash_shorts']})")
-            
-            # Build display copy (drop the internal distribution column for table display)
-            raw = result["cash_short_table"].copy()
-            t = raw.drop(columns=["_mc_all_pnl"]).copy()
-            t["Underlying Vol"] = t["Underlying Vol"].apply(fmt_pct)
-            t["1Y Simple Decay"] = t["1Y Simple Decay"].apply(fmt_pct)
-            t["Spot"] = t["Spot"].apply(lambda x: fmt_money(x, show_cents=True) if x else "—")
-            t["Qty"] = t["Qty"].apply(fmt_int)
-            t["Notional ($)"] = t["Notional ($)"].apply(fmt_money)
-            t["Simple $ P&L"] = t["Simple $ P&L"].apply(fmt_money)
-            t["MC Mean $ P&L"] = t["MC Mean $ P&L"].apply(fmt_money)
-            t["MC Median $ P&L"] = t["MC Median $ P&L"].apply(fmt_money)
-            t["MC 5th pct"] = t["MC 5th pct"].apply(fmt_money)
-            t["MC 95th pct"] = t["MC 95th pct"].apply(fmt_money)
-            t["MC Win Rate"] = t["MC Win Rate"].apply(lambda x: fmt_pct(x, 1))
-            st.dataframe(t, hide_index=True, use_container_width=True)
-            st.caption(
-                "**Median** = typical outcome (used as primary metric — robust to tails). "
-                "**Mean** = average including extreme tail paths (distorted by rare LAI mega-rallies). "
-                "**Win Rate** = % of paths with positive P&L. **5th/95th** = range of typical outcomes."
-            )
-            
-            # ===== DISTRIBUTION HISTOGRAMS =====
-            st.markdown("##### Distribution of Outcomes per Position")
-            st.caption(
-                "Each histogram shows the full distribution of P&L across all Monte Carlo paths. "
-                "You can see why the mean differs from median — the left tail (catastrophic rallies) "
-                "drags the mean down. Vertical lines: median (green), mean (orange), 5/95 pct (dashed gray)."
-            )
-            
-            for _, row in raw.iterrows():
-                ticker = row["Ticker"]
-                all_pnl = row.get("_mc_all_pnl")
-                if all_pnl is None or (hasattr(all_pnl, "__len__") and len(all_pnl) == 0):
-                    continue
-                
-                # Convert to $M for plotting
-                pnl_m = np.array(all_pnl) / 1e6
-                
-                fig_hist = go.Figure()
-                fig_hist.add_trace(go.Histogram(
-                    x=pnl_m,
-                    nbinsx=80,
-                    marker_color="#0A1931",
-                    opacity=0.75,
-                    name=ticker,
-                    hovertemplate="P&L: $%{x:.1f}M<br>Paths: %{y}<extra></extra>",
-                ))
-                
-                median_m = row["MC Median $ P&L"] / 1e6
-                mean_m = row["MC Mean $ P&L"] / 1e6
-                p5_m = row["MC 5th pct"] / 1e6
-                p95_m = row["MC 95th pct"] / 1e6
-                
-                fig_hist.add_vline(x=median_m, line_dash="solid", line_color="#2E8B57", line_width=3,
-                                    annotation_text=f"Median ${median_m:,.1f}M", annotation_position="top")
-                fig_hist.add_vline(x=mean_m, line_dash="solid", line_color="#D4A017", line_width=3,
-                                    annotation_text=f"Mean ${mean_m:,.1f}M", annotation_position="top right")
-                fig_hist.add_vline(x=p5_m, line_dash="dash", line_color="#888", line_width=1,
-                                    annotation_text=f"5% ${p5_m:,.1f}M", annotation_position="bottom")
-                fig_hist.add_vline(x=p95_m, line_dash="dash", line_color="#888", line_width=1,
-                                    annotation_text=f"95% ${p95_m:,.1f}M", annotation_position="bottom")
-                fig_hist.add_vline(x=0, line_dash="dot", line_color="#B22222", line_width=2)
-                
-                fig_hist.update_layout(
-                    title=f"{ticker} — Distribution of 1Y P&L across {mc_paths:,} paths",
-                    xaxis_title="Annual P&L ($M)",
-                    yaxis_title="# of Paths",
-                    height=400,
-                    plot_bgcolor="white",
-                    paper_bgcolor="white",
-                    showlegend=False,
-                    bargap=0.02,
+            for cfg in configs:
+                hist_results[f"{lai}_{cfg['label']}"] = historical_backtest(
+                    underlying=underlying, target_notional=target_notional,
+                    tracking_leverage=tracking_leverage, include_puts=True,
+                    put_strike_pct=cfg['strike_pct'], put_notional_ratio=cfg['ratio'],
+                    history=hist,
                 )
-                fig_hist.update_xaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
-                fig_hist.update_yaxes(gridcolor="#EEE")
-                st.plotly_chart(fig_hist, use_container_width=True)
+    
+    # Summary table across all 6 configs
+    st.subheader("Summary — Historical Backtest")
+    summary_rows = []
+    for lai in ['SQQQ', 'SOXS']:
+        for label in ['unhedged', '95% @ 3.45×', '90% @ 3.9×']:
+            r = hist_results[f"{lai}_{label}"]
+            summary_rows.append({
+                "Leg": lai,
+                "Hedge Config": label,
+                "Avg Annual Return": fmt_pct(r['avg_annual'], 1),
+                "CAGR": fmt_pct(r['cagr'], 1),
+                "MaxDD": fmt_pct(r['max_dd'], 1),
+                "Ann Vol": fmt_pct(r['ann_vol'], 1),
+                "Sharpe": f"{r['sharpe']:.2f}",
+                "Calmar": f"{r['calmar']:.2f}",
+                "Total P&L": fmt_money(r['total_pnl']),
+                "Avg Gross": fmt_money(r['path_avg_gross']),
+            })
+    st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+    
+    # Identify best Calmar per leg
+    sqqq_calmars = [hist_results[f"SQQQ_{c['label']}"]['calmar'] for c in configs]
+    soxs_calmars = [hist_results[f"SOXS_{c['label']}"]['calmar'] for c in configs]
+    sqqq_best = configs[int(np.argmax(sqqq_calmars))]['label']
+    soxs_best = configs[int(np.argmax(soxs_calmars))]['label']
+    
+    st.success(
+        f"**Highest Calmar (historical, hedged):** "
+        f"SQQQ → {sqqq_best} (Calmar {max(sqqq_calmars):.2f}) · "
+        f"SOXS → {soxs_best} (Calmar {max(soxs_calmars):.2f})"
+    )
+    
+    # Yearly breakdown per leg
+    for lai in ['SQQQ', 'SOXS']:
+        st.subheader(f"{lai} — Yearly Detail")
+        # Combine all three configs into a single side-by-side yearly table
+        yearly_combined = None
+        for label in ['unhedged', '95% @ 3.45×', '90% @ 3.9×']:
+            r = hist_results[f"{lai}_{label}"]
+            df = r['yearly_df'].copy()
+            df = df.rename(columns={
+                'P&L ($)': f"P&L — {label}",
+                'Return %': f"Return — {label}",
+                'Avg Gross ($)': f"Avg Gross — {label}",
+            })
+            # Drop 'Days' column for all but first
+            if yearly_combined is None:
+                yearly_combined = df
+            else:
+                yearly_combined = yearly_combined.merge(
+                    df.drop(columns=['Days']), on='Year', how='outer',
+                )
         
-        if len(result["protection_table"]) > 0:
-            st.subheader(f"Protection Puts — Monthly Roll ({result['n_protection_options']})")
-            t = result["protection_table"].copy()
-            # Apply formatting only to columns that exist (defensive against version mismatches)
-            def safe_fmt(col, formatter):
-                if col in t.columns:
-                    t[col] = t[col].apply(formatter)
-            
-            safe_fmt("Existing Strike", lambda x: fmt_money(x, show_cents=True))
-            safe_fmt("Strike", lambda x: fmt_money(x, show_cents=True))  # old schema fallback
-            safe_fmt("Spot", lambda x: fmt_money(x, show_cents=True))
-            safe_fmt("Moneyness", lambda x: f"{x*100:.1f}%")
-            safe_fmt("IV Used", lambda x: fmt_pct(x, 1))
-            safe_fmt("Fresh 3M Price", lambda x: fmt_money(x, show_cents=True))
-            safe_fmt("Aged 2M Price", lambda x: fmt_money(x, show_cents=True))
-            safe_fmt("Buy Price", lambda x: fmt_money(x, show_cents=True))  # old schema fallback
-            safe_fmt("Sell Price (after roll)", lambda x: fmt_money(x, show_cents=True))  # old schema fallback
-            safe_fmt("Current Mid", lambda x: fmt_money(x, show_cents=True))  # old schema fallback
-            safe_fmt("Qty", fmt_int)
-            safe_fmt("Per-Roll Cost ($)", fmt_money)
-            safe_fmt("Annual Cost ($)", fmt_money)
-            st.dataframe(t, hide_index=True, use_container_width=True)
-            st.caption(
-                "Monthly roll model: buy fresh 3M put at current spot × moneyness strike; "
-                "1 month later sell as 2M put (assuming spot unchanged, IV constant). "
-                "Per-roll cost × 12 = annualized drag. "
-                "If IV Used looks wrong, check the option on the Positions tab."
+        # Format for display
+        disp = yearly_combined.copy()
+        for col in disp.columns:
+            if col == 'Year' or col == 'Days':
+                continue
+            if col.startswith('P&L') or col.startswith('Avg Gross'):
+                disp[col] = disp[col].apply(lambda x: fmt_money(x) if pd.notna(x) else "—")
+            elif col.startswith('Return'):
+                disp[col] = disp[col].apply(lambda x: fmt_pct(x, 1) if pd.notna(x) else "—")
+        st.dataframe(disp, hide_index=True, use_container_width=True)
+        
+        # Equity curve chart
+        fig_eq = go.Figure()
+        for label in ['unhedged', '95% @ 3.45×', '90% @ 3.9×']:
+            r = hist_results[f"{lai}_{label}"]
+            equity_curve = r['target_notional'] + r['cum_pnl']
+            fig_eq.add_trace(go.Scatter(
+                x=r['dates'], y=equity_curve / 1e6,
+                mode='lines', name=label, line=dict(width=2),
+                hovertemplate=f"{label}<br>%{{x|%b %Y}}<br>Equity: $%{{y:.2f}}M<extra></extra>",
+            ))
+        fig_eq.update_layout(
+            title=f"{lai} — Equity Curve (starting ${target_notional/1e6:.0f}M)",
+            xaxis_title="Date", yaxis_title="Equity ($M)",
+            height=380, plot_bgcolor="white", paper_bgcolor="white",
+            margin=dict(t=40),
+        )
+        fig_eq.update_xaxes(gridcolor="#EEE")
+        fig_eq.update_yaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
+        st.plotly_chart(fig_eq, use_container_width=True)
+    
+    # ========================================================================
+    # SECTION 2: FORWARD MONTE CARLO
+    # ========================================================================
+    st.markdown("---")
+    st.header("Forward Monte Carlo — Distribution of Outcomes")
+    st.caption(
+        f"{n_paths:,} simulated {horizon_years}-year paths. 20-day joint block bootstrap of "
+        f"(underlying return, VIX, VXN). Preserves spot-vol correlation and regime structure."
+    )
+    
+    with st.spinner(f"Running {n_paths:,} Monte Carlo paths per config (6 configs total)..."):
+        mc_results = {}
+        for lai, underlying in [('SQQQ', 'QQQ'), ('SOXS', 'SOXX')]:
+            mc_results[f"{lai}_unhedged"] = forward_mc(
+                underlying=underlying, target_notional=target_notional,
+                tracking_leverage=tracking_leverage, include_puts=False,
+                horizon_years=horizon_years, n_paths=n_paths, history=hist,
             )
-        
-        st.markdown("---")
-        
-        # ===== SENSITIVITY: VOL SWEEP =====
-        st.subheader("Sensitivity — Underlying Vol Sweep (underlying flat)")
-        st.caption(
-            "Total strategy annual P&L as underlying realized vol varies. "
-            "Spot held constant, MC applied to LAI shorts, LAI options re-valued at each vol."
-        )
-        with st.spinner("Running vol sweep..."):
-            vol_table = sensitivity_vol_sweep(
-                enriched,
-                vol_grid=[0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70],
-                tracking_leverage=tracking_leverage,
-                mc_paths=3000,
-            )
-        if len(vol_table) > 0:
-            # Build display as plain dict-rows to avoid pandas mixed-dtype issues
-            vol_cols = [f"{v*100:.0f}%" for v in vol_table["Vol"]]
-            pnl_row = {"Metric": "Total P&L ($M)"}
-            ret_row = {"Metric": "Return on Gross (%)"}
-            for i, col in enumerate(vol_cols):
-                x = vol_table["Total P&L ($M)"].iloc[i]
-                pnl_row[col] = f"${x:,.1f}M" if x >= 0 else f"-${abs(x):,.1f}M"
-                ret_row[col] = fmt_pct(vol_table["Return on Gross (%)"].iloc[i], 1)
-            vol_display_df = pd.DataFrame([pnl_row, ret_row])
-            st.dataframe(vol_display_df, hide_index=True, use_container_width=True)
-        
-        st.markdown("---")
-        
-        # ===== SENSITIVITY: SPOT SWEEP =====
-        st.subheader("Sensitivity — Underlying Spot Sweep (vol at current)")
-        st.caption(
-            "Total strategy annual P&L as the underlying moves from -50% to +50% over the year. "
-            "Realized vol held at current 260-day level. LAI shorts: MC with drift matching the move. "
-            "Protection puts: monthly roll cost at stressed spot."
-        )
-        with st.spinner("Running spot sweep..."):
-            spot_table = sensitivity_spot_sweep(
-                enriched,
-                spot_grid=[-0.50, -0.40, -0.30, -0.20, -0.10, 0.0, 0.10, 0.20, 0.30, 0.40, 0.50],
-                tracking_leverage=tracking_leverage,
-                mc_paths=3000,
-            )
-        if len(spot_table) > 0:
-            spot_cols = [fmt_pct(v, 0) for v in spot_table["Spot Move"]]
-            pnl_row = {"Metric": "Total P&L ($M)"}
-            ret_row = {"Metric": "Return on Gross (%)"}
-            for i, col in enumerate(spot_cols):
-                x = spot_table["Total P&L ($M)"].iloc[i]
-                pnl_row[col] = f"${x:,.1f}M" if x >= 0 else f"-${abs(x):,.1f}M"
-                ret_row[col] = fmt_pct(spot_table["Return on Gross (%)"].iloc[i], 1)
-            spot_display_df = pd.DataFrame([pnl_row, ret_row])
-            st.dataframe(spot_display_df, hide_index=True, use_container_width=True)
-        
-        st.markdown("---")
-        
-        # ===== STRATEGY TOTAL P&L DISTRIBUTION (across percentiles) =====
-        st.subheader("Strategy Total P&L — Distribution by Percentile")
-        st.caption(
-            "Combined MC distribution across all cash short positions (summed path-by-path), "
-            "then offset by annual LAI option P&L and protection cost. "
-            "Shows the full shape of expected 1-year strategy outcomes."
-        )
-        
-        # Sum the MC P&L arrays across all cash short positions to get portfolio short P&L per path
-        cash_short_mc_arrays = [
-            row["_mc_all_pnl"] for _, row in result["cash_short_table"].iterrows()
-            if row.get("_mc_all_pnl") is not None
-        ]
-        if len(cash_short_mc_arrays) > 0:
-            # Stack and sum per-path (assumes same n_paths across all positions)
-            try:
-                import numpy as _np
-                stacked = _np.vstack(cash_short_mc_arrays)
-                total_short_pnl_per_path = stacked.sum(axis=0)
-                
-                # Add the deterministic legs (LAI options + protection cost)
-                opt_and_cost_offset = (
-                    result["total_lai_option_annual_usd"]
-                    - result["total_protection_annual_cost_usd"]
+            for cfg in configs:
+                mc_results[f"{lai}_{cfg['label']}"] = forward_mc(
+                    underlying=underlying, target_notional=target_notional,
+                    tracking_leverage=tracking_leverage, include_puts=True,
+                    put_strike_pct=cfg['strike_pct'], put_notional_ratio=cfg['ratio'],
+                    horizon_years=horizon_years, n_paths=n_paths, history=hist,
                 )
-                strategy_pnl_per_path = total_short_pnl_per_path + opt_and_cost_offset
-                
-                # Compute percentiles 0, 10, 20, ..., 90, 100
-                pct_levels = list(range(0, 101, 10))
-                pct_values = [float(_np.percentile(strategy_pnl_per_path, p)) for p in pct_levels]
-                
-                # Percentile bar chart
-                fig_pct = go.Figure()
-                colors = [
-                    "#8B0000" if v < 0 else "#2E8B57"  # red below zero, green above
-                    for v in pct_values
-                ]
-                fig_pct.add_trace(go.Bar(
-                    x=[f"{p}th" for p in pct_levels],
-                    y=[v / 1e6 for v in pct_values],
-                    marker_color=colors,
-                    text=[f"${v/1e6:,.1f}M" if v >= 0 else f"-${abs(v)/1e6:,.1f}M" for v in pct_values],
-                    textposition="outside",
-                    hovertemplate="%{x} percentile: $%{y:.2f}M<extra></extra>",
-                ))
-                fig_pct.add_hline(y=0, line_dash="dash", line_color="#888")
-                fig_pct.update_layout(
-                    xaxis_title="Percentile of Strategy P&L Distribution",
-                    yaxis_title="Annual Strategy P&L ($M)",
-                    height=450,
-                    plot_bgcolor="white",
-                    paper_bgcolor="white",
-                    showlegend=False,
-                    margin=dict(t=30),
-                )
-                fig_pct.update_yaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
-                st.plotly_chart(fig_pct, use_container_width=True)
-                
-                # Summary table
-                pct_table = pd.DataFrame({
-                    "Percentile": [f"{p}th" for p in pct_levels],
-                    "Strategy P&L ($)": [fmt_money(v) for v in pct_values],
-                    "Strategy P&L ($M)": [f"${v/1e6:+,.2f}M" for v in pct_values],
-                    "% of Gross": [
-                        fmt_pct(v / result["total_gross_exposure"], 1)
-                        if result["total_gross_exposure"] > 0 else "—"
-                        for v in pct_values
-                    ],
-                })
-                st.dataframe(pct_table, hide_index=True, use_container_width=True)
-                
-                st.caption(
-                    f"Strategy = [$\\Sigma$ LAI short MC paths] + [LAI option expected P&L] − [protection roll cost]. "
-                    f"Median (50th pct) strategy P&L: **{fmt_money(_np.median(strategy_pnl_per_path))}**. "
-                    f"Strategy wins in {(strategy_pnl_per_path > 0).mean()*100:.1f}% of paths."
-                )
-                
-                # Full distribution histogram  
-                st.markdown("**Full P&L distribution across all MC paths**")
-                fig_dist = go.Figure()
-                pnl_m = strategy_pnl_per_path / 1e6
-                fig_dist.add_trace(go.Histogram(
-                    x=pnl_m,
-                    nbinsx=80,
-                    marker_color="#0A1931",
-                    opacity=0.8,
-                    hovertemplate="P&L: $%{x:.1f}M<br>Paths: %{y}<extra></extra>",
-                ))
-                median_m = float(_np.median(pnl_m))
-                mean_m = float(_np.mean(pnl_m))
-                fig_dist.add_vline(x=median_m, line_dash="solid", line_color="#2E8B57", line_width=3,
-                                    annotation_text=f"Median ${median_m:,.1f}M",
-                                    annotation_position="top")
-                fig_dist.add_vline(x=mean_m, line_dash="solid", line_color="#D4A017", line_width=3,
-                                    annotation_text=f"Mean ${mean_m:,.1f}M",
-                                    annotation_position="top right")
-                fig_dist.add_vline(x=0, line_dash="dot", line_color="#B22222", line_width=2)
-                fig_dist.update_layout(
-                    xaxis_title="Annual Strategy P&L ($M)",
-                    yaxis_title="# of Paths",
-                    height=380,
-                    plot_bgcolor="white",
-                    paper_bgcolor="white",
-                    showlegend=False,
-                    bargap=0.02,
-                )
-                fig_dist.update_xaxes(tickprefix="$", ticksuffix="M", gridcolor="#EEE")
-                fig_dist.update_yaxes(gridcolor="#EEE")
-                st.plotly_chart(fig_dist, use_container_width=True)
-            except Exception as e:
-                st.warning(f"Could not compute strategy distribution: {e}")
+    
+    # Summary MC table (medians)
+    st.subheader("Summary — Forward MC Medians")
+    mc_summary = []
+    for lai in ['SQQQ', 'SOXS']:
+        for label in ['unhedged', '95% @ 3.45×', '90% @ 3.9×']:
+            r = mc_results[f"{lai}_{label}"]
+            mc_summary.append({
+                "Leg": lai,
+                "Hedge Config": label,
+                "Median Avg Annual": fmt_pct(r['median_avg_annual'], 1),
+                "Median CAGR": fmt_pct(r['median_cagr'], 1),
+                "Median MaxDD": fmt_pct(r['median_max_dd'], 1),
+                "Median Calmar": f"{r['median_calmar']:.2f}",
+                "Median Sharpe": f"{r['median_sharpe']:.2f}",
+                "Win Rate": fmt_pct(r['win_rate'], 1),
+            })
+    st.dataframe(pd.DataFrame(mc_summary), hide_index=True, use_container_width=True)
+    
+    # Percentile distribution per leg
+    for lai in ['SQQQ', 'SOXS']:
+        st.subheader(f"{lai} — Avg Annual Return Distribution (MC)")
         
-        st.markdown("---")
-        st.info(
-            "**Methodology notes:**\n\n"
-            "1. **Simple vol decay formula** (reference only): `(1 + r)^L × exp((L − L²) × σ² × T / 2) − 1` — "
-            "closed-form idealized expected decay of the LAI price. Does NOT capture path dependence or historical drift.\n\n"
-            "2. **Monte Carlo compounded short (PRIMARY METHOD)**: uses **historical block bootstrap** of actual "
-            "underlying (QQQ, SOXX) daily returns in 5-day blocks. Preserves volatility clustering, historical drift "
-            "(e.g. +20% QQQ / +29% SOXX annualized over 2020-2026), momentum, mean reversion. Applies tracking leverage "
-            "to generate LAI daily returns, then daily top-up rule. Median P&L is the primary metric.\n\n"
-            "3. **Protection roll cost**: 3M fresh put bought at current moneyness × spot; 1 month later sold as a 2M put "
-            "(assuming spot unchanged). Per-roll cost = buy − sell. Annualized cost = per-roll × 12.\n\n"
-            "4. **Tracking leverage** defaults to -3x but is adjustable. In Covid 2020 and April 2025 Liberation Day, "
-            "realized tracking for SOXS was closer to -6x. Stress modes -4/-5/-6x available."
+        # Combine 3 configs into one percentile table
+        pcts_to_show = [5, 10, 25, 50, 75, 90, 95]
+        pct_rows = []
+        for label in ['unhedged', '95% @ 3.45×', '90% @ 3.9×']:
+            r = mc_results[f"{lai}_{label}"]
+            pct_rows.append({
+                "Hedge Config": label,
+                **{f"{p}th": fmt_pct(r['avg_ann_percentiles'][p], 1) for p in pcts_to_show},
+            })
+        st.dataframe(pd.DataFrame(pct_rows), hide_index=True, use_container_width=True)
+        
+        # Bar chart showing percentiles side-by-side
+        fig_pct = go.Figure()
+        colors = {'unhedged': '#8B0000', '95% @ 3.45×': '#0A1931', '90% @ 3.9×': '#D4A017'}
+        pct_levels = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        for label in ['unhedged', '95% @ 3.45×', '90% @ 3.9×']:
+            r = mc_results[f"{lai}_{label}"]
+            values = [r['avg_ann_percentiles'][p] if p in r['avg_ann_percentiles'] 
+                      else np.percentile(r['avg_annual_per_path'], p) for p in pct_levels]
+            fig_pct.add_trace(go.Bar(
+                x=[f"{p}th" for p in pct_levels],
+                y=[v*100 for v in values],
+                name=label, marker_color=colors.get(label, '#888'),
+                text=[f"{v*100:+.1f}%" for v in values],
+                textposition="outside", textfont=dict(size=9),
+            ))
+        fig_pct.add_hline(y=0, line_dash="dash", line_color="#555")
+        fig_pct.update_layout(
+            title=f"{lai} — Avg Annual Return by Percentile",
+            xaxis_title="Percentile", yaxis_title="Avg Annual Return (%)",
+            height=400, plot_bgcolor="white", paper_bgcolor="white",
+            barmode="group", margin=dict(t=50),
         )
+        fig_pct.update_yaxes(ticksuffix="%", gridcolor="#EEE")
+        st.plotly_chart(fig_pct, use_container_width=True)
+    
+    # Methodology notes
+    st.markdown("---")
+    st.info(
+        "**Methodology notes:**\n\n"
+        "1. **Historical Backtest** replays actual 2020-2026 daily returns deterministically. "
+        "Strategy mechanics: daily top-up short to target when short MV < target; let MV ride when above. "
+        "Puts bought as 3M vanilla at entry, marked-to-market daily using dynamic IV (VXN for QQQ puts, "
+        "VIX × 1.33 for SOXX puts), rolled monthly. This should reproduce the hardcoded Bloomberg spreadsheet.\n\n"
+        "2. **Forward Monte Carlo** uses 20-day joint block bootstrap — random contiguous 20-day windows "
+        "from history, concatenated with wraparound, for each simulated path. Preserves vol clustering, "
+        "spot-vol correlation, and within-month regime dynamics. 5,000 paths per config.\n\n"
+        "3. **Denominator for returns**: gross capital = short notional + |put delta| × contracts × 100 × spot, "
+        "averaged across days within the year. So yearly return % = yearly P&L / yearly avg gross.\n\n"
+        "4. **Avg Annual Return** (primary KPI) = arithmetic mean of yearly returns. "
+        "**CAGR** = (Π(1+yearly_return))^(1/n) − 1 (reinvestment interpretation).\n\n"
+        "5. **Dynamic IV**: QQQ puts priced at bootstrapped VXN; SOXX puts priced at bootstrapped VIX × 1.33 "
+        "(SOXX beta to SPX). This captures the fact that IV spikes during crashes, making puts respond realistically."
+    )
+
 
 # =========================================================================
 # PAGE: STRESS SCENARIO
